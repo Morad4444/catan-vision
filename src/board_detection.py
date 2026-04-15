@@ -109,6 +109,94 @@ def draw_points(image_bgr, points, color=(0, 0, 255), radius=8):
     return img
 
 
+def regular_hexagon_points(side_length, center, rotation_rad=0.0):
+    """Return regular hexagon vertices in the order expected by order_hexagon_points."""
+    a = float(side_length)
+    h = a * np.sqrt(3.0) / 2.0
+    pts = np.array(
+        [
+            [-a / 2.0, -h],
+            [a / 2.0, -h],
+            [a, 0.0],
+            [a / 2.0, h],
+            [-a / 2.0, h],
+            [-a, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    if rotation_rad != 0.0:
+        c = np.cos(rotation_rad)
+        s = np.sin(rotation_rad)
+        rot = np.array([[c, -s], [s, c]], dtype=np.float32)
+        pts = pts.dot(rot.T)
+
+    return pts + np.array(center, dtype=np.float32)
+
+
+def normalize_hexagon(image_bgr, ordered_points, output_size=800, margin=20):
+    """Warp the detected board into a regular equilateral hexagon image."""
+    pts = np.asarray(ordered_points, dtype=np.float32)
+    if pts.shape != (6, 2):
+        raise ValueError(f"ordered_points must be shape (6,2), got {pts.shape}")
+
+    centroid_src = np.mean(pts, axis=0)
+    side_lengths = [
+        np.linalg.norm(pts[(i + 1) % 6] - pts[i])
+        for i in range(6)
+    ]
+    side = float(np.mean(side_lengths))
+
+    output_size = int(output_size)
+    target_width = 2.0 * side
+    target_height = np.sqrt(3.0) * side
+    scale = min(
+        (output_size - 2 * margin) / target_width,
+        (output_size - 2 * margin) / target_height,
+    )
+    target_side = side * scale
+    center = np.array([output_size / 2.0, output_size / 2.0], dtype=np.float32)
+    dst_pts = regular_hexagon_points(target_side, center)
+    centroid_dst = center
+
+    result = np.zeros((output_size, output_size, 3), dtype=image_bgr.dtype)
+
+    for i in range(6):
+        src_tri = np.array(
+            [centroid_src, pts[i], pts[(i + 1) % 6]],
+            dtype=np.float32,
+        )
+        dst_tri = np.array(
+            [centroid_dst, dst_pts[i], dst_pts[(i + 1) % 6]],
+            dtype=np.float32,
+        )
+
+        x, y, w, h = cv2.boundingRect(dst_tri)
+        if w == 0 or h == 0:
+            continue
+
+        dst_rect = dst_tri - np.array([x, y], dtype=np.float32)
+
+        M = cv2.getAffineTransform(src_tri, dst_rect)
+        patch = cv2.warpAffine(
+            image_bgr,
+            M,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT,
+        )
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, np.array(dst_rect, dtype=np.int32), 255)
+        mask_bool = mask.astype(bool)
+
+        roi = result[y : y + h, x : x + w]
+        roi[mask_bool] = patch[mask_bool]
+        result[y : y + h, x : x + w] = roi
+
+    return result, dst_pts
+
+
 def _normalize(v):
     n = np.linalg.norm(v)
     if n < 1e-8:

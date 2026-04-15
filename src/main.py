@@ -11,6 +11,7 @@ from board_detection import (
     draw_points,
     generate_catan_tile_centers_from_hex,
     draw_tile_centers,
+    normalize_hexagon,
 )
 
 from tile_classification import (
@@ -52,20 +53,23 @@ def process_board_geometry(image_bgr, prefix: str):
     hex_img = draw_points(hex_img, ordered_points)
     save_image(OUTPUT_DIR / f"{prefix}_outer_hex.png", hex_img)
 
-    centers = generate_catan_tile_centers_from_hex(ordered_points)
+    normalized_img, normalized_points = normalize_hexagon(image_bgr, ordered_points)
+    save_image(OUTPUT_DIR / f"{prefix}_normalized_hex.png", normalized_img)
 
-    centers_img = draw_tile_centers(image_bgr, centers)
-    centers_img = draw_contour(centers_img, ordered_points)
+    centers = generate_catan_tile_centers_from_hex(normalized_points)
+
+    centers_img = draw_tile_centers(normalized_img, centers)
+    centers_img = draw_contour(centers_img, normalized_points)
     save_image(OUTPUT_DIR / f"{prefix}_tile_centers.png", centers_img)
 
-    return ordered_points, centers
+    return normalized_img, normalized_points, centers
 
 
 def main():
     ensure_dir(OUTPUT_DIR)
 
     image_empty = load_image(BOARD_EMPTY_IMAGE)
-    ordered_empty, centers_empty = process_board_geometry(image_empty, "empty")
+    normalized_empty, ordered_empty, centers_empty = process_board_geometry(image_empty, "empty")
 
     print("\nEmpty image tile centers:")
     for tile_id, x, y in centers_empty:
@@ -74,7 +78,7 @@ def main():
     all_scores = []
     print("\nResource scores:")
     for tile_id, x, y in centers_empty:
-        tile_patch = crop_tile(image_empty, x, y, size=50)
+        tile_patch = crop_tile(normalized_empty, x, y, size=50)
         scores = score_tile(tile_patch)
         all_scores.append(scores)
 
@@ -89,7 +93,7 @@ def main():
         print(f"Tile {tile_id}: {label}")
 
     labeled_img = draw_tile_labels(
-        draw_tile_centers(image_empty, centers_empty),
+        draw_tile_centers(normalized_empty, centers_empty),
         centers_empty,
         labels,
     )
@@ -97,13 +101,13 @@ def main():
     save_image(OUTPUT_DIR / "empty_resource_labels.png", labeled_img)
 
     image_numbers = load_image(BOARD_NUMBERS_IMAGE)
-    ordered_numbers, centers_numbers = process_board_geometry(image_numbers, "numbers")
+    normalized_numbers, ordered_numbers, centers_numbers = process_board_geometry(image_numbers, "numbers")
 
     print("\nNumbers image tile centers:")
     for tile_id, x, y in centers_numbers:
         print(f"Tile {tile_id}: x={x}, y={y}")
 
-    chips = detect_chips(image_numbers, centers_numbers)
+    chips = detect_chips(normalized_numbers, centers_numbers)
     
     save_chip_debug_patches(chips, OUTPUT_DIR / "chip_debug")
 
@@ -118,7 +122,7 @@ def main():
             f"detected={item['detected']}"
         )
 
-    chips_img = draw_chips(image_numbers, chips)
+    chips_img = draw_chips(normalized_numbers, chips)
     chips_img = draw_contour(chips_img, ordered_numbers)
     save_image(OUTPUT_DIR / "numbers_chip_detections.png", chips_img)
 
@@ -131,7 +135,7 @@ def main():
 
     print_recognition_summary(recognition_results)
 
-    numbers_img = draw_recognized_numbers(image_numbers, recognition_results)
+    numbers_img = draw_recognized_numbers(normalized_numbers, recognition_results)
     numbers_img = draw_contour(numbers_img, ordered_numbers)
     save_image(OUTPUT_DIR / "numbers_recognized.png", numbers_img)
 
@@ -149,7 +153,7 @@ def main():
             f"top3=[{top3}]"
         )
 
-    numbers_img = draw_recognized_numbers(image_numbers, recognition_results)
+    numbers_img = draw_recognized_numbers(normalized_numbers, recognition_results)
     numbers_img = draw_contour(numbers_img, ordered_numbers)
     save_image(OUTPUT_DIR / "numbers_recognized.png", numbers_img)
 
@@ -161,7 +165,7 @@ def main():
             f"r={item['chip_r']}, detected={item['detected']}"
         )
 
-    assign_img = draw_chip_tile_assignments(image_numbers, assignments)
+    assign_img = draw_chip_tile_assignments(normalized_numbers, assignments)
     assign_img = draw_contour(assign_img, ordered_numbers)
     save_image(OUTPUT_DIR / "numbers_chip_assignments.png", assign_img)
 
