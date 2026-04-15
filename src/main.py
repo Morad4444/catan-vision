@@ -1,3 +1,4 @@
+import cv2
 from config import BOARD_EMPTY_IMAGE, BOARD_NUMBERS_IMAGE, BOARD_PIECES_IMAGE, OUTPUT_DIR
 from utils import ensure_dir, load_image, save_image
 from pathlib import Path
@@ -13,6 +14,7 @@ from board_detection import (
     generate_catan_tile_centers_from_hex,
     draw_tile_centers,
     normalize_hexagon,
+    debug_board_detection,
 )
 
 from tile_classification import (
@@ -40,6 +42,16 @@ from piece_detection import (
     draw_corner_analysis,
 )
 
+def print_corner_hsv_values(image_bgr, points, prefix: str):
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    print(f"\n{prefix}: HSV-Werte der Eckpunkte:")
+    for idx, (x, y) in enumerate(points):
+        xi = max(0, min(int(round(x)), hsv.shape[1] - 1))
+        yi = max(0, min(int(round(y)), hsv.shape[0] - 1))
+        h, s, v = hsv[yi, xi]
+        print(f"  Ecke {idx}: (x={xi}, y={yi}) -> H={h}, S={s}, V={v}")
+
+
 def process_board_geometry(image_bgr, prefix: str):
     contour = detect_board_contour(image_bgr)
     polygon = approximate_polygon(contour)
@@ -49,6 +61,8 @@ def process_board_geometry(image_bgr, prefix: str):
 
     points = polygon_to_points(polygon)
     ordered_points = order_hexagon_points(points)
+
+    print_corner_hsv_values(image_bgr, ordered_points, prefix)
 
     hex_img = draw_contour(image_bgr, ordered_points)
     hex_img = draw_points(hex_img, ordered_points)
@@ -69,8 +83,9 @@ def process_board_geometry(image_bgr, prefix: str):
 def main():
     ensure_dir(OUTPUT_DIR)
 
-    image_empty = load_image(BOARD_EMPTY_IMAGE)
-    normalized_empty, ordered_empty, centers_empty = process_board_geometry(image_empty, "empty")
+    image_empty = load_image(BOARD_NUMBERS_IMAGE)
+    normalized_empty, ordered_empty = debug_board_detection(image_empty, OUTPUT_DIR / "debug_empty")
+    centers_empty = generate_catan_tile_centers_from_hex(ordered_empty)
 
     print("\nEmpty image tile centers:")
     for tile_id, x, y in centers_empty:
@@ -102,7 +117,8 @@ def main():
     save_image(OUTPUT_DIR / "empty_resource_labels.png", labeled_img)
 
     image_numbers = load_image(BOARD_NUMBERS_IMAGE)
-    normalized_numbers, ordered_numbers, centers_numbers = process_board_geometry(image_numbers, "numbers")
+    normalized_numbers, ordered_numbers = debug_board_detection(image_numbers, OUTPUT_DIR / "debug_numbers")
+    centers_numbers = generate_catan_tile_centers_from_hex(ordered_numbers)
 
     print("\nNumbers image tile centers:")
     for tile_id, x, y in centers_numbers:
