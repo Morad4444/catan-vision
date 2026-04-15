@@ -5,5 +5,3 @@ __pycache__/
 # Output data (generated)
 data/output/
 
-# Optional: raw temp images
-data/raw/*.png
