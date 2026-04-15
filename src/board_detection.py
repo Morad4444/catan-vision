@@ -2,89 +2,81 @@ import cv2
 import numpy as np
 
 
-def detect_board_contour(image_bgr):
-    """
-    Detect the Catan board using its blue outer region.
-    Returns the largest contour found in the blue mask.
-    """
+def blue_mask(image_bgr):
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
 
-    # Blue range for the ocean border
-    lower_blue = np.array([90, 80, 80], dtype=np.uint8)
-    upper_blue = np.array([130, 255, 255], dtype=np.uint8)
+    lower = np.array([85, 60, 60], dtype=np.uint8)
+    upper = np.array([130, 255, 255], dtype=np.uint8)
 
-    mask = cv2.inRange(hsv, lower_blue, upper_blue)
+    mask = cv2.inRange(hsv, lower, upper)
 
     kernel = np.ones((7, 7), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
+    return mask
+
+
+def detect_board_contour(image_bgr):
+    mask = blue_mask(image_bgr)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
-        raise RuntimeError("No contours found in blue mask.")
+        raise RuntimeError("No contour found for board.")
 
-    largest = max(contours, key=cv2.contourArea)
-    return largest
+    return max(contours, key=cv2.contourArea)
 
 
 def approximate_polygon(contour):
-    """
-    Approximate a contour to a simpler polygon.
-    For the Catan board we expect 6 points.
-    """
-    epsilon = 0.02 * cv2.arcLength(contour, True)
-    approx = cv2.approxPolyDP(contour, epsilon, True)
-    return approx
+    perimeter = cv2.arcLength(contour, True)
+
+    best_poly = None
+    best_diff = 1e9
+
+    for factor in np.linspace(0.005, 0.05, 30):
+        epsilon = factor * perimeter
+        poly = cv2.approxPolyDP(contour, epsilon, True)
+        diff = abs(len(poly) - 6)
+
+        if diff < best_diff:
+            best_diff = diff
+            best_poly = poly
+
+        if len(poly) == 6:
+            return poly
+
+    return best_poly
 
 
 def polygon_to_points(polygon):
-    """
-    Convert OpenCV polygon shape (N,1,2) into NumPy array (N,2).
-    """
-    return polygon.reshape(-1, 2).astype(np.float32)
+    return np.array([p[0] for p in polygon], dtype=np.float32)
 
 
 def order_hexagon_points(points):
     """
-    Order 6 outer board points as:
-    0 = top-left
-    1 = top-right
-    2 = right
-    3 = bottom-right
-    4 = bottom-left
-    5 = left
+    Order as:
+    [top-left, top-right, right, bottom-right, bottom-left, left]
     """
-    if len(points) != 6:
-        raise ValueError(f"Expected 6 points, got {len(points)}")
+    pts = np.asarray(points, dtype=np.float32)
 
-    pts = np.array(points, dtype=np.float32)
-
-    # sort by y coordinate
     y_sorted = pts[np.argsort(pts[:, 1])]
 
-    # top two, middle two, bottom two
-    top_two = y_sorted[:2]
-    mid_two = y_sorted[2:4]
-    bottom_two = y_sorted[4:]
+    top2 = y_sorted[:2]
+    mid2 = y_sorted[2:4]
+    bot2 = y_sorted[4:6]
 
-    # sort left/right inside each group
-    top_two = top_two[np.argsort(top_two[:, 0])]
-    mid_two = mid_two[np.argsort(mid_two[:, 0])]
-    bottom_two = bottom_two[np.argsort(bottom_two[:, 0])]
-
-    top_left, top_right = top_two
-    left_mid, right_mid = mid_two
-    bottom_left, bottom_right = bottom_two
+    top_left, top_right = top2[np.argsort(top2[:, 0])]
+    left_mid, right_mid = mid2[np.argsort(mid2[:, 0])]
+    bottom_left, bottom_right = bot2[np.argsort(bot2[:, 0])]
 
     ordered = np.array(
         [
-            top_left,      # 0
-            top_right,     # 1
-            right_mid,     # 2
-            bottom_right,  # 3
-            bottom_left,   # 4
-            left_mid,      # 5
+            top_left,
+            top_right,
+            right_mid,
+            bottom_right,
+            bottom_left,
+            left_mid,
         ],
         dtype=np.float32,
     )
@@ -92,164 +84,21 @@ def order_hexagon_points(points):
     return ordered
 
 
-def draw_contour(image_bgr, contour, color=(0, 255, 0), thickness=3):
-    """
-    Draw a contour on a copy of the image.
-    """
-    image_copy = image_bgr.copy()
-    cv2.drawContours(image_copy, [contour], -1, color, thickness)
-    return image_copy
+def draw_contour(image_bgr, polygon, color=(0, 255, 0), thickness=4):
+    img = image_bgr.copy()
+    cv2.polylines(img, [polygon.astype(np.int32)], True, color, thickness)
+    return img
 
 
-def draw_points(image_bgr, points, color=(0, 0, 255), radius=10):
-    """
-    Draw numbered points on the image.
-    """
-    image_copy = image_bgr.copy()
+def draw_points(image_bgr, points, color=(0, 0, 255), radius=8):
+    img = image_bgr.copy()
 
     for i, (x, y) in enumerate(points):
-        x_i, y_i = int(x), int(y)
-        cv2.circle(image_copy, (x_i, y_i), radius, color, -1)
+        cv2.circle(img, (int(x), int(y)), radius, color, -1)
         cv2.putText(
-            image_copy,
+            img,
             str(i),
-            (x_i + 10, y_i - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-    return image_copy
-
-
-def get_bounding_quad(points):
-    """
-    Convert the ordered outer hexagon points into a bounding rectangle.
-    Returns:
-    top-left, top-right, bottom-right, bottom-left
-    """
-    x_min = np.min(points[:, 0])
-    x_max = np.max(points[:, 0])
-    y_min = np.min(points[:, 1])
-    y_max = np.max(points[:, 1])
-
-    quad = np.array(
-        [
-            [x_min, y_min],
-            [x_max, y_min],
-            [x_max, y_max],
-            [x_min, y_max],
-        ],
-        dtype=np.float32,
-    )
-    return quad
-
-
-def warp_board_to_square(image_bgr, src_points, size=1000):
-    """
-    Warp the board into a square image using the bounding rectangle.
-    Returns:
-    warped_image, source_quad
-    """
-    quad = get_bounding_quad(src_points)
-
-    dst = np.array(
-        [
-            [0, 0],
-            [size - 1, 0],
-            [size - 1, size - 1],
-            [0, size - 1],
-        ],
-        dtype=np.float32,
-    )
-
-    H = cv2.getPerspectiveTransform(quad, dst)
-    warped = cv2.warpPerspective(image_bgr, H, (size, size))
-
-    return warped, quad
-
-
-def transform_points(points, H):
-    """
-    Apply homography H to a set of 2D points of shape (N,2).
-    """
-    pts = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
-    transformed = cv2.perspectiveTransform(pts, H)
-    return transformed.reshape(-1, 2)
-
-
-def generate_catan_tile_centers_from_hex(ordered_points):
-    """
-    Generate the 19 tile centers directly from the outer hexagon geometry
-    on the ORIGINAL image.
-
-    Point convention:
-    0 = top-left
-    1 = top-right
-    2 = right
-    3 = bottom-right
-    4 = bottom-left
-    5 = left
-    """
-    import numpy as np
-
-    p0 = ordered_points[0]
-    p1 = ordered_points[1]
-    p2 = ordered_points[2]
-    p3 = ordered_points[3]
-    p4 = ordered_points[4]
-    p5 = ordered_points[5]
-
-    # Midpoints of top and bottom board edges
-    top_mid = (p0 + p1) / 2.0
-    bottom_mid = (p4 + p3) / 2.0
-
-    # Center tile (tile 9) anchor
-    center = (top_mid + bottom_mid) / 2.0
-
-    # Correct center-to-center step vectors
-    scale = 0.78
-    # left outer vertex -> right outer vertex = 5 horizontal tile steps
-    step_x = (p2 - p5) / 5.0 * scale
-
-    # top outer edge midpoint -> bottom outer edge midpoint = 5 row steps
-    step_y = (bottom_mid - top_mid) / 5.0 * scale
-
-    row_lengths = [3, 4, 5, 4, 3]
-    row_offsets = [-2, -1, 0, 1, 2]
-
-    centers = []
-    tile_id = 0
-
-    for row_len, row_offset in zip(row_lengths, row_offsets):
-        row_center = center + row_offset * step_y
-        row_start = row_center - ((row_len - 1) / 2.0) * step_x
-
-        for i in range(row_len):
-            pos = row_start + i * step_x
-            centers.append((tile_id, int(round(pos[0])), int(round(pos[1]))))
-            tile_id += 1
-
-    return centers
-
-def draw_tile_centers(image_bgr, centers):
-    """
-    Draw tile centers and ids on the image.
-    """
-    image = image_bgr.copy()
-
-    for tile_id, x, y in centers:
-        cv2.circle(image, (x, y), 10, (0, 0, 255), -1)
-
-        cv2.line(image, (x - 12, y), (x + 12, y), (255, 255, 255), 2)
-        cv2.line(image, (x, y - 12), (x, y + 12), (255, 255, 255), 2)
-
-        cv2.putText(
-            image,
-            str(tile_id),
-            (x + 12, y - 12),
+            (int(x) + 10, int(y) - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
             (255, 255, 255),
@@ -257,4 +106,161 @@ def draw_tile_centers(image_bgr, centers):
             cv2.LINE_AA,
         )
 
-    return image
+    return img
+
+
+def _normalize(v):
+    n = np.linalg.norm(v)
+    if n < 1e-8:
+        raise RuntimeError("Zero-length vector encountered.")
+    return v / n
+
+
+def _rotate(v, angle_rad):
+    c = np.cos(angle_rad)
+    s = np.sin(angle_rad)
+    return np.array(
+        [
+            c * v[0] - s * v[1],
+            s * v[0] + c * v[1],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _signed_angle(a, b):
+    """
+    Signed angle from vector a to vector b.
+    """
+    cross = a[0] * b[1] - a[1] * b[0]
+    dot = a[0] * b[0] + a[1] * b[1]
+    return np.arctan2(cross, dot)
+
+
+def generate_catan_tile_centers_from_hex(ordered_points, step_divisor=6.8):
+    """
+    Generate centers by propagating from tile 9.
+
+    ordered_points:
+    [top-left, top-right, right, bottom-right, bottom-left, left]
+
+    Outer indices in this order:
+    p0=top-left, p1=top-right, p2=right, p3=bottom-right, p4=bottom-left, p5=left
+
+    User-defined construction:
+    - center 9 = midpoint of p5 and p2
+    - step = |p2 - p5| / 5.2
+    - horizontal move along p5 -> p2
+    - diagonal move = same length, tilted by angle between line (5->2) and line (5->4)
+    """
+    pts = np.asarray(ordered_points, dtype=np.float32)
+    if pts.shape != (6, 2):
+        raise ValueError(f"ordered_points must be shape (6,2), got {pts.shape}")
+
+    p0, p1, p2, p3, p4, p5 = pts
+
+    # center 9
+    c9 = 0.5 * (p5 + p2)
+
+    # basic step length
+    base_vec = p2 - p5
+    step = np.linalg.norm(base_vec) / step_divisor
+
+    # horizontal direction
+    hx = _normalize(base_vec)
+    right_vec = hx * step
+    left_vec = -right_vec
+
+    # diagonal direction from angle between (5->2) and (5->4)
+    v52 = p2 - p5
+    v54 = p4 - p5
+    angle = _signed_angle(v52, v54)
+
+    diag_down_left = _rotate(hx, angle) * step
+    diag_up_right = -diag_down_left
+
+    diag_up_left = _rotate(hx, -angle) * step
+    diag_down_right = -diag_up_left
+
+    centers = {}
+
+    # center
+    centers[9] = c9
+
+    # from 9 -> 8 and 10
+    centers[8] = centers[9] + left_vec
+    centers[10] = centers[9] + right_vec
+
+    # from 8 -> 7, 12, 13, 3, 4
+    centers[7] = centers[8] + left_vec
+    centers[12] = centers[8] + diag_down_left
+    centers[13] = centers[8] + diag_down_right
+    centers[3] = centers[8] + diag_up_left
+    centers[4] = centers[8] + diag_up_right
+
+    # from 10 -> 11, 14, 15, 5, 6
+    centers[11] = centers[10] + right_vec
+    centers[14] = centers[10] + diag_down_left
+    centers[15] = centers[10] + diag_down_right
+    centers[5] = centers[10] + diag_up_left
+    centers[6] = centers[10] + diag_up_right
+
+    # from 4 -> 0, 1
+    centers[0] = centers[4] + diag_up_left
+    centers[1] = centers[6] + diag_up_right
+
+    # from 5 -> 2
+    centers[2] = centers[5] + diag_up_right
+
+    # from 13 -> 16, 17
+    centers[16] = centers[13] + diag_down_left
+    centers[17] = centers[12] + diag_down_left
+
+    # from 14 -> 18
+    centers[18] = centers[14] + diag_down_right
+
+    # convert to plain point list first
+    pts_only = [centers[i] for i in range(19)]
+
+    # sort roughly by y first
+    pts_only = sorted(pts_only, key=lambda p: p[1])
+
+    # split into 5 rows: 3,4,5,4,3
+    row_counts = [3, 4, 5, 4, 3]
+    rows = []
+
+    start = 0
+    for count in row_counts:
+        row = pts_only[start:start + count]
+        row = sorted(row, key=lambda p: p[0])  # left to right
+        rows.append(row)
+        start += count
+
+    # assign final tile ids in normal row-major order
+    result = []
+    tile_id = 0
+    for row in rows:
+        for x, y in row:
+            result.append((tile_id, int(round(x)), int(round(y))))
+            tile_id += 1
+
+    return result
+
+
+def draw_tile_centers(image_bgr, centers, color=(0, 0, 255), radius=8):
+    img = image_bgr.copy()
+
+    for tile_id, x, y in centers:
+        cv2.circle(img, (x, y), radius, color, -1)
+        cv2.putText(
+            img,
+            str(tile_id),
+            (x + 10, y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    return img

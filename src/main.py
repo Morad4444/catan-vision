@@ -1,8 +1,7 @@
-import numpy as np
-import matplotlib.pyplot as plt
+from config import BOARD_EMPTY_IMAGE, BOARD_NUMBERS_IMAGE, OUTPUT_DIR
+from utils import ensure_dir, load_image, save_image
+from pathlib import Path
 
-from config import BOARD_EMPTY_IMAGE, OUTPUT_DIR
-from utils import ensure_dir, load_image, save_image, convert_bgr_to_rgb
 from board_detection import (
     detect_board_contour,
     approximate_polygon,
@@ -14,93 +13,160 @@ from board_detection import (
     draw_tile_centers,
 )
 
+from tile_classification import (
+    crop_tile,
+    score_tile,
+    assign_resources_with_counts,
+    draw_tile_labels,
+)
 
-def save_plot(image_bgr, title, output_path):
-    image_rgb = convert_bgr_to_rgb(image_bgr)
-    plt.figure(figsize=(8, 8))
-    plt.imshow(image_rgb)
-    plt.title(title)
-    plt.axis("off")
-    plt.savefig(output_path, bbox_inches="tight")
-    plt.close()
+from chip_detection import (
+    detect_chips,
+    assign_chips_to_tiles,
+    draw_chips,
+    draw_chip_tile_assignments,
+    save_chip_debug_patches,
+)
+
+
+from number_detection import (
+    recognize_chip_numbers,
+    constrain_recognized_numbers,
+    draw_recognized_numbers,
+    print_recognition_summary,
+    save_number_debug_images,
+    save_preprocessed_templates,
+)
+
+def process_board_geometry(image_bgr, prefix: str):
+    contour = detect_board_contour(image_bgr)
+    polygon = approximate_polygon(contour)
+
+    if len(polygon) != 6:
+        raise RuntimeError(f"{prefix}: expected 6 polygon points, got {len(polygon)}")
+
+    points = polygon_to_points(polygon)
+    ordered_points = order_hexagon_points(points)
+
+    hex_img = draw_contour(image_bgr, ordered_points)
+    hex_img = draw_points(hex_img, ordered_points)
+    save_image(OUTPUT_DIR / f"{prefix}_outer_hex.png", hex_img)
+
+    centers = generate_catan_tile_centers_from_hex(ordered_points)
+
+    centers_img = draw_tile_centers(image_bgr, centers)
+    centers_img = draw_contour(centers_img, ordered_points)
+    save_image(OUTPUT_DIR / f"{prefix}_tile_centers.png", centers_img)
+
+    return ordered_points, centers
 
 
 def main():
     ensure_dir(OUTPUT_DIR)
 
-    # 1) load image
-    image_bgr = load_image(BOARD_EMPTY_IMAGE)
+    image_empty = load_image(BOARD_EMPTY_IMAGE)
+    ordered_empty, centers_empty = process_board_geometry(image_empty, "empty")
 
-    # 2) detect board contour
-    contour = detect_board_contour(image_bgr)
-    polygon = approximate_polygon(contour)
-
-    if len(polygon) != 6:
-        raise RuntimeError(
-            f"Expected 6 polygon points for the board, but got {len(polygon)}"
-        )
-
-    # 3) save contour image
-    contour_image = draw_contour(image_bgr, polygon)
-    contour_path = OUTPUT_DIR / "board_polygon.png"
-    save_image(contour_path, contour_image)
-    save_plot(contour_image, "Detected Board Polygon", OUTPUT_DIR / "board_polygon_plot.png")
-
-    # 4) order outer points
-    points = polygon_to_points(polygon)
-    ordered_points = order_hexagon_points(points)
-
-    points_image = draw_points(image_bgr, ordered_points, color=(0, 0, 255), radius=10)
-    points_image = draw_contour(points_image, polygon)
-    points_path = OUTPUT_DIR / "board_points.png"
-    save_image(points_path, points_image)
-    save_plot(points_image, "Ordered Outer Board Points", OUTPUT_DIR / "board_points_plot.png")
-
-    print("\nOrdered outer hexagon points:")
-    for i, (x, y) in enumerate(ordered_points):
-        print(f"Point {i}: x={x:.2f}, y={y:.2f}")
-
-    # 5) print vector from point 5 to point 2
-    p5 = ordered_points[5]
-    p2 = ordered_points[2]
-
-    dx = p2[0] - p5[0]
-    dy = p2[1] - p5[1]
-    dist = np.sqrt(dx**2 + dy**2)
-
-    print("\nMeasurement from outer point 5 to outer point 2:")
-    print(f"Point 5: ({p5[0]:.2f}, {p5[1]:.2f})")
-    print(f"Point 2: ({p2[0]:.2f}, {p2[1]:.2f})")
-    print(f"dx = {dx:.2f}")
-    print(f"dy = {dy:.2f}")
-    print(f"distance = {dist:.2f}")
-
-    print("\nEqual step along 5 -> 2:")
-    print(f"step_dx = {dx / 4.0:.2f}")
-    print(f"step_dy = {dy / 4.0:.2f}")
-
-    # 6) generate tile centers directly on original image
-    centers = generate_catan_tile_centers_from_hex(ordered_points)
-
-    centers_image = draw_tile_centers(image_bgr, centers)
-    centers_image = draw_contour(centers_image, polygon)
-
-    centers_path = OUTPUT_DIR / "tile_centers_on_original.png"
-    save_image(centers_path, centers_image)
-    save_plot(
-        centers_image,
-        "Tile Centers on Original Image",
-        OUTPUT_DIR / "tile_centers_on_original_plot.png",
-    )
-
-    print("\nGenerated tile centers:")
-    for tile_id, x, y in centers:
+    print("\nEmpty image tile centers:")
+    for tile_id, x, y in centers_empty:
         print(f"Tile {tile_id}: x={x}, y={y}")
 
-    print("\nSaved files:")
-    print(f"- {contour_path}")
-    print(f"- {points_path}")
-    print(f"- {centers_path}")
+    all_scores = []
+    print("\nResource scores:")
+    for tile_id, x, y in centers_empty:
+        tile_patch = crop_tile(image_empty, x, y, size=50)
+        scores = score_tile(tile_patch)
+        all_scores.append(scores)
+
+        top3 = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        top_text = ", ".join([f"{name}={score:.1f}" for name, score in top3])
+        print(f"Tile {tile_id}: {top_text}")
+
+    labels = assign_resources_with_counts(all_scores)
+
+    print("\nFinal resource labels:")
+    for (tile_id, _, _), label in zip(centers_empty, labels):
+        print(f"Tile {tile_id}: {label}")
+
+    labeled_img = draw_tile_labels(
+        draw_tile_centers(image_empty, centers_empty),
+        centers_empty,
+        labels,
+    )
+    labeled_img = draw_contour(labeled_img, ordered_empty)
+    save_image(OUTPUT_DIR / "empty_resource_labels.png", labeled_img)
+
+    image_numbers = load_image(BOARD_NUMBERS_IMAGE)
+    ordered_numbers, centers_numbers = process_board_geometry(image_numbers, "numbers")
+
+    print("\nNumbers image tile centers:")
+    for tile_id, x, y in centers_numbers:
+        print(f"Tile {tile_id}: x={x}, y={y}")
+
+    chips = detect_chips(image_numbers, centers_numbers)
+    
+    save_chip_debug_patches(chips, OUTPUT_DIR / "chip_debug")
+
+    print("\nChip detections:")
+    for item in chips:
+        print(
+            f"Tile {item['tile_id']}: "
+            f"center=({item['tile_x']}, {item['tile_y']}), "
+            f"chip=({item['chip_x']}, {item['chip_y']}), "
+            f"r_detected={item['chip_r_detected']}, "
+            f"r_inner={item['chip_r']}, "
+            f"detected={item['detected']}"
+        )
+
+    chips_img = draw_chips(image_numbers, chips)
+    chips_img = draw_contour(chips_img, ordered_numbers)
+    save_image(OUTPUT_DIR / "numbers_chip_detections.png", chips_img)
+
+    assignments = assign_chips_to_tiles(chips, labels)
+
+    template_dir = Path(__file__).resolve().parent.parent / "data" / "templates" / "numbers"
+
+    recognition_results = recognize_chip_numbers(assignments, template_dir)
+    recognition_results = constrain_recognized_numbers(recognition_results)
+
+    print_recognition_summary(recognition_results)
+
+    numbers_img = draw_recognized_numbers(image_numbers, recognition_results)
+    numbers_img = draw_contour(numbers_img, ordered_numbers)
+    save_image(OUTPUT_DIR / "numbers_recognized.png", numbers_img)
+
+    save_number_debug_images(recognition_results, template_dir, OUTPUT_DIR / "number_debug")
+    save_preprocessed_templates(template_dir, OUTPUT_DIR / "template_debug")
+
+    print("\nRecognized chip numbers:")
+    for item in recognition_results:
+        top3 = ", ".join([f"{n}:{s:.2f}" for n, s in item["number_top_scores"]])
+        print(
+            f"Tile {item['tile_id']} ({item['label']}) -> "
+            f"pred={item['predicted_number']}, "
+            f"score={item['number_score']:.3f}, "
+            f"rot={item['number_rotation']:.1f}, "
+            f"top3=[{top3}]"
+        )
+
+    numbers_img = draw_recognized_numbers(image_numbers, recognition_results)
+    numbers_img = draw_contour(numbers_img, ordered_numbers)
+    save_image(OUTPUT_DIR / "numbers_recognized.png", numbers_img)
+
+    print("\nFinal chip assignments (non-desert only):")
+    for item in assignments:
+        print(
+            f"Tile {item['tile_id']} ({item['label']}): "
+            f"chip=({item['chip_x']}, {item['chip_y']}), "
+            f"r={item['chip_r']}, detected={item['detected']}"
+        )
+
+    assign_img = draw_chip_tile_assignments(image_numbers, assignments)
+    assign_img = draw_contour(assign_img, ordered_numbers)
+    save_image(OUTPUT_DIR / "numbers_chip_assignments.png", assign_img)
+
+    print("\nSaved outputs in:")
+    print(OUTPUT_DIR)
 
 
 if __name__ == "__main__":
