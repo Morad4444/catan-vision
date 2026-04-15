@@ -93,16 +93,6 @@ def main():
     for (tile_id, _, _), label in zip(centers_empty, labels):
         print(f"Tile {tile_id}: {label}")
 
-    # Analyze tile corners
-    tile_size = estimate_tile_size_from_centers(centers_empty)
-    tile_corners = generate_tile_corners_from_centers(centers_empty, tile_size)
-    analyze_corner_colors(normalized_empty, tile_corners)
-
-    # Draw and save corner analysis image
-    corner_analysis_img = draw_corner_analysis(normalized_empty, tile_corners)
-    corner_analysis_img = draw_contour(corner_analysis_img, ordered_empty)
-    save_image(OUTPUT_DIR / "corner_analysis.png", corner_analysis_img)
-
     labeled_img = draw_tile_labels(
         draw_tile_centers(normalized_empty, centers_empty),
         centers_empty,
@@ -142,8 +132,6 @@ def main():
     save_chip_preprocessing_debug(assignments, OUTPUT_DIR / "chip_preprocess_debug")
 
 
-    
-
 
     print("\nFinal chip assignments (non-desert only):")
     for item in assignments:
@@ -160,6 +148,19 @@ def main():
 
     print("\nSaved outputs in:")
     print(OUTPUT_DIR)
+
+    # Analyze tile corners
+    image_pieces = load_image(BOARD_PIECES_IMAGE)
+    normalized_pieces, ordered_pieces, centers_pices = process_board_geometry(image_pieces, "empty")
+
+    tile_size = estimate_tile_size_from_centers(centers_pices)
+    tile_corners = generate_tile_corners_from_centers(centers_pices, tile_size)
+    analyze_corner_colors(normalized_pieces, tile_corners)
+
+    # Draw and save corner analysis image
+    corner_analysis_img = draw_corner_analysis(normalized_pieces, tile_corners)
+    corner_analysis_img = draw_contour(corner_analysis_img, ordered_pieces)
+    save_image(OUTPUT_DIR / "corner_analysis.png", corner_analysis_img)
 
 #    # Process board_pieces.png
 #    image_pieces = load_image(BOARD_PIECES_IMAGE)
