@@ -1,6 +1,7 @@
 from config import BOARD_EMPTY_IMAGE, BOARD_NUMBERS_IMAGE, BOARD_PIECES_IMAGE, OUTPUT_DIR
 from utils import ensure_dir, load_image, save_image
 from pathlib import Path
+from number_detection import save_chip_preprocessing_debug
 
 from board_detection import (
     detect_board_contour,
@@ -30,14 +31,7 @@ from chip_detection import (
 )
 
 
-from number_detection import (
-    recognize_chip_numbers,
-    constrain_recognized_numbers,
-    draw_recognized_numbers,
-    print_recognition_summary,
-    save_number_debug_images,
-    save_preprocessed_templates,
-)
+
 
 from piece_detection import (
     estimate_tile_size_from_centers,
@@ -145,34 +139,11 @@ def main():
 
     assignments = assign_chips_to_tiles(chips, labels)
 
-    template_dir = Path(__file__).resolve().parent.parent / "data" / "templates" / "numbers"
+    save_chip_preprocessing_debug(assignments, OUTPUT_DIR / "chip_preprocess_debug")
 
-    recognition_results = recognize_chip_numbers(assignments, template_dir)
-    recognition_results = constrain_recognized_numbers(recognition_results)
 
-    print_recognition_summary(recognition_results)
+    
 
-    numbers_img = draw_recognized_numbers(normalized_numbers, recognition_results)
-    numbers_img = draw_contour(numbers_img, ordered_numbers)
-    save_image(OUTPUT_DIR / "numbers_recognized.png", numbers_img)
-
-    save_number_debug_images(recognition_results, template_dir, OUTPUT_DIR / "number_debug")
-    save_preprocessed_templates(template_dir, OUTPUT_DIR / "template_debug")
-
-    print("\nRecognized chip numbers:")
-    for item in recognition_results:
-        top3 = ", ".join([f"{n}:{s:.2f}" for n, s in item["number_top_scores"]])
-        print(
-            f"Tile {item['tile_id']} ({item['label']}) -> "
-            f"pred={item['predicted_number']}, "
-            f"score={item['number_score']:.3f}, "
-            f"rot={item['number_rotation']:.1f}, "
-            f"top3=[{top3}]"
-        )
-
-    numbers_img = draw_recognized_numbers(normalized_numbers, recognition_results)
-    numbers_img = draw_contour(numbers_img, ordered_numbers)
-    save_image(OUTPUT_DIR / "numbers_recognized.png", numbers_img)
 
     print("\nFinal chip assignments (non-desert only):")
     for item in assignments:
@@ -184,6 +155,7 @@ def main():
 
     assign_img = draw_chip_tile_assignments(normalized_numbers, assignments)
     assign_img = draw_contour(assign_img, ordered_numbers)
+    
     save_image(OUTPUT_DIR / "numbers_chip_assignments.png", assign_img)
 
     print("\nSaved outputs in:")

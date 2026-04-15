@@ -1,0 +1,9 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Output data (generated)
+data/output/
+
+# Optional: raw temp images
+data/raw/*.png
