@@ -5,7 +5,8 @@ from pathlib import Path
 
 def estimate_tile_size_from_centers(centers):
     """
-    Estimate tile side length from nearest center spacing.
+    Estimate tile size from nearest-neighbor spacing between tile centers.
+    centers: list of (tile_id, x, y)
     """
     pts = np.array([(x, y) for _, x, y in centers], dtype=np.float32)
 
@@ -23,58 +24,80 @@ def estimate_tile_size_from_centers(centers):
     return tile_size
 
 
-def crop_tile_patch(image_bgr, center_x, center_y, tile_size, margin_factor=0.95):
+def crop_center_patch(image_bgr, center_x, center_y, half_size):
     """
-    Crop one local tile patch around a tile center.
-    This is saved as tile_*.png
+    Crop a square patch centered at (center_x, center_y).
+    Returns:
+        patch, x1, y1
+    where (x1, y1) is the top-left corner in the original image.
     """
     h, w = image_bgr.shape[:2]
-    half = int(round(tile_size * margin_factor))
+    half_size = int(round(half_size))
 
-    x1 = max(0, int(center_x - half))
-    y1 = max(0, int(center_y - half))
-    x2 = min(w, int(center_x + half))
-    y2 = min(h, int(center_y + half))
+    x1 = max(0, int(center_x - half_size))
+    y1 = max(0, int(center_y - half_size))
+    x2 = min(w, int(center_x + half_size))
+    y2 = min(h, int(center_y + half_size))
 
     patch = image_bgr[y1:y2, x1:x2].copy()
     return patch, x1, y1
 
 
-def detect_white_chip(img_rgb):
+def crop_tile_patch(image_bgr, center_x, center_y, tile_size, margin_factor=0.60):
     """
-    Detect the best white chip inside one tile patch.
+    Crop the tile patch around the tile center.
+    This is saved as tile_*.png
+    """
+    half = tile_size * margin_factor
+    return crop_center_patch(image_bgr, center_x, center_y, half)
+
+
+def detect_chip_in_tile_patch(tile_patch_bgr):
+    """
+    Detect the white chip inside one tile patch using HoughCircles.
+
     Returns:
-        result_img_rgb, chip_crop_rgb, best_circle
-    where best_circle = (x, y, r) in tile-patch coordinates.
+        best_circle = (x, y, r) in tile-patch coordinates, or None
+        tile_patch_detected = tile patch with circle drawn if found
+        chip_patch = cropped chip image from detected circle, or None
     """
-    img = img_rgb.copy()
+    img = tile_patch_bgr.copy()
     h, w = img.shape[:2]
 
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    gray_blur = cv2.GaussianBlur(gray, (9, 9), 2)
+    if h == 0 or w == 0:
+        return None, img, None
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (9, 9), 2)
 
     circles = cv2.HoughCircles(
-        gray_blur,
+        gray,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
-        minDist=max(20, min(h, w) // 3),
+        minDist=max(18, min(h, w) // 4),
         param1=100,
-        param2=22,
-        minRadius=max(12, int(min(h, w) * 0.12)),
-        maxRadius=max(25, int(min(h, w) * 0.33)),
+        param2=18,
+        minRadius=max(10, int(min(h, w) * 0.10)),
+        maxRadius=max(20, int(min(h, w) * 0.28)),
     )
 
     best_circle = None
     best_score = -1e9
 
-    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-    v = hsv[:, :, 2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+
+    patch_cx = w / 2.0
+    patch_cy = h / 2.0
 
     if circles is not None:
-        circles = np.round(circles[0, :]).astype("int")
+        circles = np.round(circles[0]).astype(int)
 
         for (x, y, r) in circles:
+            if r <= 0:
+                continue
+
             mask = np.zeros((h, w), dtype=np.uint8)
             cv2.circle(mask, (x, y), r, 255, -1)
 
@@ -82,142 +105,99 @@ def detect_white_chip(img_rgb):
             if np.count_nonzero(inside) == 0:
                 continue
 
-            brightness = float(np.mean(v[inside]))
-            saturation = float(np.mean(s[inside]))
+            mean_v = float(np.mean(v[inside]))
+            mean_s = float(np.mean(s[inside]))
 
-            score = brightness - saturation
+            # Prefer bright, low-saturation, centered circles
+            score = mean_v - 0.8 * mean_s
 
-            dist_to_center = np.sqrt((x - w / 2.0) ** 2 + (y - h / 2.0) ** 2)
-            score -= 0.5 * dist_to_center
+            dist = np.sqrt((x - patch_cx) ** 2 + (y - patch_cy) ** 2)
+            score -= 0.35 * dist
 
             if score > best_score:
                 best_score = score
                 best_circle = (x, y, r)
 
-    result_img = img.copy()
-    chip_crop = None
+    tile_patch_detected = img.copy()
+    chip_patch = None
 
     if best_circle is not None:
         x, y, r = best_circle
 
-        cv2.circle(result_img, (x, y), r, (0, 255, 0), 2)
-        cv2.circle(result_img, (x, y), 2, (255, 0, 0), 3)
+        cv2.circle(tile_patch_detected, (x, y), r, (0, 255, 0), 2)
+        cv2.circle(tile_patch_detected, (x, y), 2, (0, 0, 255), -1)
 
-        x1 = max(0, x - r)
-        x2 = min(w, x + r)
-        y1 = max(0, y - r)
-        y2 = min(h, y + r)
-        chip_crop = img[y1:y2, x1:x2].copy()
+        inner_r = max(1, int(round(r * 0.78)))
+        x1 = max(0, x - inner_r)
+        x2 = min(w, x + inner_r)
+        y1 = max(0, y - inner_r)
+        y2 = min(h, y + inner_r)
 
-    return result_img, chip_crop, best_circle
+        chip_patch = img[y1:y2, x1:x2].copy()
+
+    return best_circle, tile_patch_detected, chip_patch
 
 
-def detect_chip_near_center(image_bgr, center_x, center_y, tile_size):
+def detect_chips(image_bgr, centers, tile_margin_factor=0.60):
     """
-    Two-stage chip detection:
-    1) crop tile patch around tile center
-    2) run detect_white_chip on tile patch
-    Returns global coordinates:
-        (chip_x, chip_y, r_detected, r_inner, tile_patch, chip_patch, tile_patch_detected)
-    or None if not found.
-    """
-    tile_patch_bgr, x_offset, y_offset = crop_tile_patch(
-        image_bgr,
-        center_x,
-        center_y,
-        tile_size,
-        margin_factor=0.95,
-    )
+    1) Take a fixed tile crop around each tile center -> tile_*.png
+    2) Run Hough circle detection inside that tile patch
+    3) Save drawn result as tile_*_detected.png
+    4) Save chip-only crop as tile_*_chip.png
 
-    tile_patch_rgb = cv2.cvtColor(tile_patch_bgr, cv2.COLOR_BGR2RGB)
-    tile_patch_detected_rgb, chip_patch_rgb, best_circle = detect_white_chip(tile_patch_rgb)
-
-    if best_circle is None:
-        return None
-
-    local_x, local_y, r_detected = best_circle
-    r_inner = max(1, int(round(r_detected * 0.68)))
-
-    # small refinement toward tile-patch center
-    patch_h, patch_w = tile_patch_bgr.shape[:2]
-    patch_cx = patch_w // 2
-    patch_cy = patch_h // 2
-
-    dx = local_x - patch_cx
-    dy = local_y - patch_cy
-
-    max_shift = int(0.25 * r_detected)
-    dx = max(-max_shift, min(max_shift, dx))
-    dy = max(-max_shift, min(max_shift, dy))
-
-    refined_local_x = int(round(patch_cx + 0.5 * dx))
-    refined_local_y = int(round(patch_cy + 0.5 * dy))
-
-    chip_x = int(x_offset + refined_local_x)
-    chip_y = int(y_offset + refined_local_y)
-
-    tile_patch_detected_bgr = cv2.cvtColor(tile_patch_detected_rgb, cv2.COLOR_RGB2BGR)
-    chip_patch_bgr = None
-    if chip_patch_rgb is not None:
-        chip_patch_bgr = cv2.cvtColor(chip_patch_rgb, cv2.COLOR_RGB2BGR)
-
-    return (
-        chip_x,
-        chip_y,
-        int(r_detected),
-        r_inner,
-        tile_patch_bgr,
-        chip_patch_bgr,
-        tile_patch_detected_bgr,
-    )
-
-
-def detect_chips(image_bgr, centers):
-    """
-    Detect chips near the tile centers.
     Returns one result per tile center.
     """
     tile_size = estimate_tile_size_from_centers(centers)
     detections = []
 
-    outer_rs = []
-    inner_rs = []
+    detected_rs = []
 
     for tile_id, tx, ty in centers:
-        result = detect_chip_near_center(image_bgr, tx, ty, tile_size)
+        tile_patch, x_offset, y_offset = crop_tile_patch(
+            image_bgr,
+            tx,
+            ty,
+            tile_size,
+            margin_factor=tile_margin_factor,
+        )
 
-        if result is None:
+        best_circle, tile_patch_detected, chip_patch = detect_chip_in_tile_patch(tile_patch)
+
+        if best_circle is None:
+            fallback_r = int(round(tile_size * 0.22))
             detections.append(
                 {
                     "tile_id": tile_id,
                     "tile_x": tx,
                     "tile_y": ty,
-                    "chip_x": tx,
-                    "chip_y": ty,
-                    "chip_r_detected": int(round(tile_size * 0.42)),
-                    "chip_r": int(round(tile_size * 0.33)),
+                    "chip_x": int(tx),
+                    "chip_y": int(ty),
+                    "chip_r_detected": fallback_r,
+                    "chip_r": int(round(fallback_r * 0.78)),
                     "detected": False,
-                    "tile_patch": None,
+                    "tile_patch": tile_patch,
                     "chip_patch": None,
-                    "tile_patch_detected": None,
+                    "tile_patch_detected": tile_patch_detected,
                 }
             )
             continue
 
-        x, y, r_detected, r_inner, tile_patch, chip_patch, tile_patch_detected = result
+        local_x, local_y, r = best_circle
+        chip_x = int(x_offset + local_x)
+        chip_y = int(y_offset + local_y)
+        chip_r = int(round(r * 0.78))
 
-        outer_rs.append(r_detected)
-        inner_rs.append(r_inner)
+        detected_rs.append(r)
 
         detections.append(
             {
                 "tile_id": tile_id,
                 "tile_x": tx,
                 "tile_y": ty,
-                "chip_x": x,
-                "chip_y": y,
-                "chip_r_detected": r_detected,
-                "chip_r": r_inner,
+                "chip_x": chip_x,
+                "chip_y": chip_y,
+                "chip_r_detected": int(r),
+                "chip_r": chip_r,
                 "detected": True,
                 "tile_patch": tile_patch,
                 "chip_patch": chip_patch,
@@ -225,13 +205,14 @@ def detect_chips(image_bgr, centers):
             }
         )
 
-    if outer_rs:
-        avg_outer = int(round(np.mean(outer_rs)))
-        avg_inner = int(round(np.mean(inner_rs)))
+    # Optional normalization of displayed radii so overlays look consistent
+    if detected_rs:
+        avg_r = int(round(np.mean(detected_rs)))
+        avg_inner = int(round(avg_r * 0.78))
 
         for item in detections:
             if item["detected"]:
-                item["chip_r_detected"] = avg_outer
+                item["chip_r_detected"] = avg_r
                 item["chip_r"] = avg_inner
 
     return detections
@@ -239,10 +220,10 @@ def detect_chips(image_bgr, centers):
 
 def save_chip_debug_patches(chips, save_dir):
     """
-    Save outputs:
-      - tile_*.png          = original tile patch
-      - tile_*_detected.png = tile patch with detected circle drawn
-      - tile_*_chip.png     = cropped chip only
+    Save:
+      - tile_*.png          = centered tile crop
+      - tile_*_detected.png = centered tile crop with detected circle
+      - tile_*_chip.png     = chip-only crop from detected circle
     """
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -283,10 +264,10 @@ def assign_chips_to_tiles(chips, labels):
 
 def draw_chips(image_bgr, chips):
     """
-    Draw all local chip detections.
-    Green = detected outer circle
+    Draw chip detections for all tiles.
+    Green = detected circle
     Yellow = inner crop radius
-    Orange = fallback circle when not detected
+    Orange = fallback when not detected
     """
     img = image_bgr.copy()
 
@@ -330,7 +311,9 @@ def draw_chip_tile_assignments(image_bgr, assignments):
         r_detected = item["chip_r_detected"]
         r_inner = item["chip_r"]
 
-        cv2.circle(img, (x, y), r_detected, (0, 255, 0), 2)
+        color = (0, 255, 0) if item["detected"] else (0, 128, 255)
+
+        cv2.circle(img, (x, y), r_detected, color, 2)
         cv2.circle(img, (x, y), r_inner, (0, 255, 255), 1)
         cv2.circle(img, (x, y), 3, (0, 0, 255), -1)
 
