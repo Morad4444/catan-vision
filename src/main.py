@@ -8,8 +8,10 @@ from board_detection import (
     approximate_polygon,
     polygon_to_points,
     order_hexagon_points,
+    set_debug_prefix,
     draw_contour,
     draw_points,
+    draw_hexagon_diagonals,
     generate_catan_tile_centers_from_hex,
     draw_tile_centers,
     normalize_hexagon,
@@ -40,28 +42,37 @@ from piece_detection import (
     draw_corner_analysis,
 )
 
+
+BOARD_DEBUG_DIR = OUTPUT_DIR / "board_debug"
+
+
 def process_board_geometry(image_bgr, prefix: str):
+    set_debug_prefix(prefix)
     contour = detect_board_contour(image_bgr)
-    polygon = approximate_polygon(contour)
+    polygon = approximate_polygon(contour, image_bgr)
 
     if len(polygon) != 6:
         raise RuntimeError(f"{prefix}: expected 6 polygon points, got {len(polygon)}")
 
     points = polygon_to_points(polygon)
-    ordered_points = order_hexagon_points(points)
+    ordered_points = order_hexagon_points(points, image_bgr)
 
     hex_img = draw_contour(image_bgr, ordered_points)
     hex_img = draw_points(hex_img, ordered_points)
-    save_image(OUTPUT_DIR / f"{prefix}_outer_hex.png", hex_img)
+    save_image(BOARD_DEBUG_DIR / f"{prefix}_outer_hex.png", hex_img)
 
     normalized_img, normalized_points = normalize_hexagon(image_bgr, ordered_points)
-    save_image(OUTPUT_DIR / f"{prefix}_normalized_hex.png", normalized_img)
+    save_image(BOARD_DEBUG_DIR / f"{prefix}_normalized_hex.png", normalized_img)
+    save_image(
+        BOARD_DEBUG_DIR / f"{prefix}_normalized_diagonals.png",
+        draw_hexagon_diagonals(normalized_img, normalized_points),
+    )
 
-    centers = generate_catan_tile_centers_from_hex(normalized_points)
+    centers = generate_catan_tile_centers_from_hex(normalized_points, normalized_img)
 
     centers_img = draw_tile_centers(normalized_img, centers)
     centers_img = draw_contour(centers_img, normalized_points)
-    save_image(OUTPUT_DIR / f"{prefix}_tile_centers.png", centers_img)
+    save_image(BOARD_DEBUG_DIR / f"{prefix}_tile_centers.png", centers_img)
 
     return normalized_img, normalized_points, centers
 
@@ -151,7 +162,7 @@ def main():
 
     # Analyze tile corners
     image_pieces = load_image(BOARD_PIECES_IMAGE)
-    normalized_pieces, ordered_pieces, centers_pices = process_board_geometry(image_pieces, "empty")
+    normalized_pieces, ordered_pieces, centers_pices = process_board_geometry(image_pieces, "pieces")
 
     tile_size = estimate_tile_size_from_centers(centers_pices)
     tile_corners = generate_tile_corners_from_centers(centers_pices, tile_size)

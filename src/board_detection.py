@@ -1,5 +1,20 @@
 import cv2
 import numpy as np
+import os
+import itertools
+
+debug_dir = "data/output/board_debug"
+os.makedirs(debug_dir, exist_ok=True)
+debug_prefix = "board"
+
+
+def set_debug_prefix(prefix):
+    global debug_prefix
+    debug_prefix = prefix
+
+
+def _debug_path(filename):
+    return os.path.join(debug_dir, f"{debug_prefix}_{filename}")
 
 
 def blue_mask(image_bgr):
@@ -14,6 +29,8 @@ def blue_mask(image_bgr):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
+    cv2.imwrite(_debug_path('01_blue_mask.png'), mask)
+
     return mask
 
 
@@ -24,73 +41,253 @@ def detect_board_contour(image_bgr):
     if not contours:
         raise RuntimeError("No contour found for board.")
 
-    return max(contours, key=cv2.contourArea)
+    contour = max(contours, key=cv2.contourArea)
+    img_with_contour = draw_contour(image_bgr, contour)
+    cv2.imwrite(_debug_path('02_board_contour.png'), img_with_contour)
+
+    return contour
 
 
-def approximate_polygon(contour):
-    perimeter = cv2.arcLength(contour, True)
+def approximate_polygon(contour, image_bgr):
+    hull = cv2.convexHull(contour, returnPoints=True).reshape(-1, 2).astype(np.float32)
 
-    best_poly = None
-    best_diff = 1e9
+    def approximate_hull_polygon(points):
+        hull_contour = points.reshape(-1, 1, 2).astype(np.float32)
+        perimeter = cv2.arcLength(hull_contour, True)
 
-    for factor in np.linspace(0.005, 0.05, 30):
-        epsilon = factor * perimeter
-        poly = cv2.approxPolyDP(contour, epsilon, True)
-        diff = abs(len(poly) - 6)
+        best_polygon = None
+        best_diff = float("inf")
 
-        if diff < best_diff:
-            best_diff = diff
-            best_poly = poly
+        for factor in np.linspace(0.0025, 0.08, 64):
+            epsilon = factor * perimeter
+            polygon = cv2.approxPolyDP(hull_contour, epsilon, True)
+            diff = abs(len(polygon) - 6)
 
-        if len(poly) == 6:
-            return poly
+            if diff < best_diff:
+                best_diff = diff
+                best_polygon = polygon
 
-    return best_poly
+            if len(polygon) == 6:
+                break
+
+        if best_polygon is None or len(best_polygon) != 6:
+            found = 0 if best_polygon is None else len(best_polygon)
+            raise RuntimeError(f"Only found {found} hull polygon points, expected 6.")
+
+        return best_polygon.reshape(-1, 2).astype(np.float32)
+
+    def fit_lines_ransac(points, num_lines=6, threshold=1.0, iterations=300, min_remaining=4):
+        rng = np.random.default_rng(0)
+        remaining = points.copy()
+        lines = []
+
+        for _ in range(num_lines):
+            if len(remaining) < min_remaining:
+                break
+
+            best_line = None
+            best_inliers = np.empty((0, 2), dtype=np.float32)
+
+            for _ in range(iterations):
+                if len(remaining) < 2:
+                    break
+
+                i, j = rng.choice(len(remaining), 2, replace=False)
+                p1, p2 = remaining[i], remaining[j]
+
+                d = p2 - p1
+                norm = np.linalg.norm(d)
+                if norm < 1e-6:
+                    continue
+                d = d / norm
+
+                diff = remaining - p1
+                dist = np.abs(diff[:, 0] * d[1] - diff[:, 1] * d[0])
+
+                inliers = remaining[dist < threshold]
+
+                if len(inliers) > len(best_inliers):
+                    best_inliers = inliers
+                    best_line = (p1, d)
+
+            if best_line is None:
+                continue
+
+            [vx, vy, x0, y0] = cv2.fitLine(
+                np.array(best_inliers), cv2.DIST_L2, 0, 0.01, 0.01
+            )
+            direction = np.array([vx, vy]).flatten().astype(np.float32)
+            direction = direction / np.linalg.norm(direction)
+            line = (np.array([x0, y0]).flatten(), direction)
+            lines.append(line)
+
+            diff = remaining - best_line[0]
+            dist = np.abs(diff[:, 0] * best_line[1][1] - diff[:, 1] * best_line[1][0])
+            remaining = remaining[dist >= threshold]
+
+        return lines
+
+    lines = fit_lines_ransac(hull)
+
+    if len(lines) < 6:
+        raise RuntimeError(f"Only found {len(lines)} lines, expected 6.")
+
+    approx_polygon = approximate_hull_polygon(hull)
+
+    def angle_between_lines(a, b):
+        dot = np.clip(abs(np.dot(a, b)), 0.0, 1.0)
+        return np.arccos(dot)
+
+    def point_line_distance(point, line):
+        p, d = line
+        diff = point - p
+        return abs(diff[0] * d[1] - diff[1] * d[0])
+
+    edge_specs = []
+    for i in range(6):
+        start = approx_polygon[i]
+        end = approx_polygon[(i + 1) % 6]
+        direction = end - start
+        direction = direction / np.linalg.norm(direction)
+        midpoint = 0.5 * (start + end)
+        edge_specs.append((direction, midpoint))
+
+    best_perm = None
+    best_score = float("inf")
+    for perm in itertools.permutations(range(6)):
+        score = 0.0
+        for edge_idx, line_idx in enumerate(perm):
+            edge_dir, midpoint = edge_specs[edge_idx]
+            line = lines[line_idx]
+            score += 100.0 * angle_between_lines(edge_dir, line[1])
+            score += point_line_distance(midpoint, line)
+
+        if score < best_score:
+            best_score = score
+            best_perm = perm
+
+    lines = [lines[i] for i in best_perm]
+
+    def intersect(l1, l2):
+        p1, d1 = l1
+        p2, d2 = l2
+
+        A = np.array([d1, -d2]).T
+        b = p2 - p1
+
+        if abs(np.linalg.det(A)) < 1e-6:
+            return (p1 + p2) / 2
+
+        t = np.linalg.solve(A, b)
+        return p1 + t[0] * d1
+
+    vertices = []
+    for i in range(6):
+        v = intersect(lines[i], lines[(i + 1) % 6])
+        vertices.append(v)
+
+    polygon = np.array(vertices, dtype=np.float32)
+    height, width = image_bgr.shape[:2]
+    polygon[:, 0] = np.clip(polygon[:, 0], 0, width - 1)
+    polygon[:, 1] = np.clip(polygon[:, 1], 0, height - 1)
+
+    debug_img = image_bgr.copy()
+    for p, d in lines:
+        p1 = (p - 1000 * d).astype(int)
+        p2 = (p + 1000 * d).astype(int)
+        cv2.line(debug_img, tuple(p1), tuple(p2), (255, 0, 0), 2)
+
+    cv2.imwrite(_debug_path('03_lines.png'), debug_img)
+
+    img_with_poly = draw_contour(image_bgr, polygon)
+    cv2.imwrite(_debug_path('04_approximated_polygon.png'), img_with_poly)
+
+    return polygon
 
 
 def polygon_to_points(polygon):
-    return np.array([p[0] for p in polygon], dtype=np.float32)
+    arr = np.asarray(polygon, dtype=np.float32)
+    if arr.ndim == 3 and arr.shape[1:] == (1, 2):
+        return arr[:, 0, :]
+    if arr.ndim == 2 and arr.shape[1] == 2:
+        return arr
+    raise ValueError(f"Unsupported polygon shape: {arr.shape}")
 
 
-def order_hexagon_points(points):
+def order_hexagon_points(points, image_bgr):
     """
     Order as:
     [top-left, top-right, right, bottom-right, bottom-left, left]
     """
-    pts = np.asarray(points, dtype=np.float32)
+    pts = polygon_to_points(points)
+    centroid = np.mean(pts, axis=0)
 
-    y_sorted = pts[np.argsort(pts[:, 1])]
+    angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
+    sorted_idx = np.argsort(angles)
+    pts = pts[sorted_idx]
 
-    top2 = y_sorted[:2]
-    mid2 = y_sorted[2:4]
-    bot2 = y_sorted[4:6]
+    # Ensure CCW order
+    if np.cross(pts[1] - pts[0], pts[2] - pts[0]) < 0:
+        pts = pts[::-1]
 
-    top_left, top_right = top2[np.argsort(top2[:, 0])]
-    left_mid, right_mid = mid2[np.argsort(mid2[:, 0])]
-    bottom_left, bottom_right = bot2[np.argsort(bot2[:, 0])]
+    def cyclic_slice(arr, start, end):
+        if start <= end:
+            return arr[start : end + 1]
+        return np.vstack((arr[start:], arr[: end + 1]))
+
+    best_top = None
+    best_bottom = None
+    best_mean_y = np.inf
+
+    for i in range(3):
+        j = (i + 3) % 6
+        top_candidate = cyclic_slice(pts, i, j)
+        bottom_candidate = cyclic_slice(pts, j, i)
+
+        if len(top_candidate) != 4 or len(bottom_candidate) != 4:
+            continue
+
+        top_interior = top_candidate[1:-1]
+        mean_y = np.mean(top_interior[:, 1])
+
+        if mean_y < best_mean_y:
+            best_mean_y = mean_y
+            best_top = top_candidate
+            best_bottom = bottom_candidate
+
+    if best_top is None or best_bottom is None:
+        raise RuntimeError("Unable to partition hexagon points into top/bottom segments.")
+
+    top_left, top_right = best_top[1], best_top[-2]
+    right = best_top[-1]
+    bottom_right, bottom_left = best_bottom[1], best_bottom[-2]
+    left = best_top[0]
 
     ordered = np.array(
         [
             top_left,
             top_right,
-            right_mid,
+            right,
             bottom_right,
             bottom_left,
-            left_mid,
+            left,
         ],
         dtype=np.float32,
     )
 
+    img_with_points = draw_points(image_bgr, ordered)
+    cv2.imwrite(_debug_path('04_ordered_points.png'), img_with_points)
+
     return ordered
 
 
-def draw_contour(image_bgr, polygon, color=(0, 255, 0), thickness=4):
+def draw_contour(image_bgr, polygon, color=(0, 255, 0), thickness=1):
     img = image_bgr.copy()
     cv2.polylines(img, [polygon.astype(np.int32)], True, color, thickness)
     return img
 
 
-def draw_points(image_bgr, points, color=(0, 0, 255), radius=8):
+def draw_points(image_bgr, points, color=(0, 0, 255), radius=4):
     img = image_bgr.copy()
 
     for i, (x, y) in enumerate(points):
@@ -105,6 +302,42 @@ def draw_points(image_bgr, points, color=(0, 0, 255), radius=8):
             2,
             cv2.LINE_AA,
         )
+
+    return img
+
+
+def draw_hexagon_diagonals(image_bgr, points):
+    pts = polygon_to_points(points)
+    if pts.shape != (6, 2):
+        raise ValueError(f"points must be shape (6,2), got {pts.shape}")
+
+    img = image_bgr.copy()
+    diagonal_colors = [
+        (255, 0, 0),
+        (0, 255, 255),
+        (255, 255, 0),
+    ]
+    intersections = []
+
+    for color, (i, j) in zip(diagonal_colors, [(0, 3), (1, 4), (2, 5)]):
+        p1 = tuple(np.round(pts[i]).astype(int))
+        p2 = tuple(np.round(pts[j]).astype(int))
+        cv2.line(img, p1, p2, color, 2, cv2.LINE_AA)
+        intersections.append(0.5 * (pts[i] + pts[j]))
+
+    center = np.mean(np.asarray(intersections, dtype=np.float32), axis=0)
+    cx, cy = np.round(center).astype(int)
+    cv2.circle(img, (cx, cy), 8, (0, 0, 255), -1)
+    cv2.putText(
+        img,
+        f"center=({cx}, {cy})",
+        (cx + 12, cy - 12),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
 
     return img
 
@@ -140,7 +373,6 @@ def normalize_hexagon(image_bgr, ordered_points, output_size=800, margin=20):
     if pts.shape != (6, 2):
         raise ValueError(f"ordered_points must be shape (6,2), got {pts.shape}")
 
-    centroid_src = np.mean(pts, axis=0)
     side_lengths = [
         np.linalg.norm(pts[(i + 1) % 6] - pts[i])
         for i in range(6)
@@ -157,42 +389,24 @@ def normalize_hexagon(image_bgr, ordered_points, output_size=800, margin=20):
     target_side = side * scale
     center = np.array([output_size / 2.0, output_size / 2.0], dtype=np.float32)
     dst_pts = regular_hexagon_points(target_side, center)
-    centroid_dst = center
+    H, _ = cv2.findHomography(pts, dst_pts, method=0)
+    if H is None:
+        raise RuntimeError("Failed to compute homography for hexagon normalization.")
 
-    result = np.zeros((output_size, output_size, 3), dtype=image_bgr.dtype)
+    result = cv2.warpPerspective(
+        image_bgr,
+        H,
+        (output_size, output_size),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
 
-    for i in range(6):
-        src_tri = np.array(
-            [centroid_src, pts[i], pts[(i + 1) % 6]],
-            dtype=np.float32,
-        )
-        dst_tri = np.array(
-            [centroid_dst, dst_pts[i], dst_pts[(i + 1) % 6]],
-            dtype=np.float32,
-        )
+    mask = np.zeros((output_size, output_size), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, np.round(dst_pts).astype(np.int32), 255)
+    result = cv2.bitwise_and(result, result, mask=mask)
 
-        x, y, w, h = cv2.boundingRect(dst_tri)
-        if w == 0 or h == 0:
-            continue
-
-        dst_rect = dst_tri - np.array([x, y], dtype=np.float32)
-
-        M = cv2.getAffineTransform(src_tri, dst_rect)
-        patch = cv2.warpAffine(
-            image_bgr,
-            M,
-            (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT,
-        )
-
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillConvexPoly(mask, np.array(dst_rect, dtype=np.int32), 255)
-        mask_bool = mask.astype(bool)
-
-        roi = result[y : y + h, x : x + w]
-        roi[mask_bool] = patch[mask_bool]
-        result[y : y + h, x : x + w] = roi
+    cv2.imwrite(_debug_path('05_normalized_hexagon.png'), result)
 
     return result, dst_pts
 
@@ -225,7 +439,7 @@ def _signed_angle(a, b):
     return np.arctan2(cross, dot)
 
 
-def generate_catan_tile_centers_from_hex(ordered_points, step_divisor=6.8):
+def generate_catan_tile_centers_from_hex(ordered_points, image_bgr, step_divisor=6.8):
     """
     Generate centers by propagating from tile 9.
 
@@ -331,6 +545,9 @@ def generate_catan_tile_centers_from_hex(ordered_points, step_divisor=6.8):
         for x, y in row:
             result.append((tile_id, int(round(x)), int(round(y))))
             tile_id += 1
+
+    img_with_centers = draw_tile_centers(image_bgr, result)
+    cv2.imwrite(_debug_path('06_tile_centers.png'), img_with_centers)
 
     return result
 
