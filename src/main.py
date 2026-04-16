@@ -39,11 +39,16 @@ from piece_detection import (
     estimate_tile_size_from_centers,
     generate_tile_corners_from_centers,
     analyze_corner_colors,
+    detect_houses_from_corner_hsv,
+    print_detected_houses,
+    print_detected_house_points,
+    draw_detected_houses,
     draw_corner_analysis,
 )
 
 
 BOARD_DEBUG_DIR = OUTPUT_DIR / "board_debug"
+PIECES_DEBUG_DIR = OUTPUT_DIR / "pieces_debug"
 
 
 def process_board_geometry(image_bgr, prefix: str):
@@ -166,12 +171,24 @@ def main():
 
     tile_size = estimate_tile_size_from_centers(centers_pices)
     tile_corners = generate_tile_corners_from_centers(centers_pices, tile_size)
-    analyze_corner_colors(normalized_pieces, tile_corners)
+    corner_samples = analyze_corner_colors(normalized_pieces, tile_corners)
+    detected_houses, house_thresholds = detect_houses_from_corner_hsv(corner_samples)
+    print_detected_houses(detected_houses, house_thresholds)
+    print_detected_house_points(detected_houses)
+
+    detected_houses_img = draw_detected_houses(normalized_pieces, detected_houses)
+    detected_houses_img = draw_contour(detected_houses_img, ordered_pieces)
+    save_image(PIECES_DEBUG_DIR / "detected_houses.png", detected_houses_img)
 
     # Draw and save corner analysis image
-    corner_analysis_img = draw_corner_analysis(normalized_pieces, tile_corners)
+    corner_analysis_img = draw_corner_analysis(
+        normalized_pieces,
+        tile_corners,
+        detected_houses=detected_houses,
+    )
     corner_analysis_img = draw_contour(corner_analysis_img, ordered_pieces)
     save_image(OUTPUT_DIR / "corner_analysis.png", corner_analysis_img)
+    save_image(PIECES_DEBUG_DIR / "corner_analysis.png", corner_analysis_img)
 
 #    # Process board_pieces.png
 #    image_pieces = load_image(BOARD_PIECES_IMAGE)
