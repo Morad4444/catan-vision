@@ -1,13 +1,11 @@
+from __future__ import annotations
+
 import cv2
 import numpy as np
 from pathlib import Path
 
 
 def estimate_tile_size_from_centers(centers):
-    """
-    Estimate tile size from nearest-neighbor spacing between tile centers.
-    centers: list of (tile_id, x, y)
-    """
     pts = np.array([(x, y) for _, x, y in centers], dtype=np.float32)
 
     nearest = []
@@ -25,12 +23,6 @@ def estimate_tile_size_from_centers(centers):
 
 
 def crop_center_patch(image_bgr, center_x, center_y, half_size):
-    """
-    Crop a square patch centered at (center_x, center_y).
-    Returns:
-        patch, x1, y1
-    where (x1, y1) is the top-left corner in the original image.
-    """
     h, w = image_bgr.shape[:2]
     half_size = int(round(half_size))
 
@@ -44,23 +36,11 @@ def crop_center_patch(image_bgr, center_x, center_y, half_size):
 
 
 def crop_tile_patch(image_bgr, center_x, center_y, tile_size, margin_factor=0.60):
-    """
-    Crop the tile patch around the tile center.
-    This is saved as tile_*.png
-    """
     half = tile_size * margin_factor
     return crop_center_patch(image_bgr, center_x, center_y, half)
 
 
 def detect_chip_in_tile_patch(tile_patch_bgr):
-    """
-    Detect the white chip inside one tile patch using HoughCircles.
-
-    Returns:
-        best_circle = (x, y, r) in tile-patch coordinates, or None
-        tile_patch_detected = tile patch with circle drawn if found
-        chip_patch = cropped chip image from detected circle, or None
-    """
     img = tile_patch_bgr.copy()
     h, w = img.shape[:2]
 
@@ -108,7 +88,6 @@ def detect_chip_in_tile_patch(tile_patch_bgr):
             mean_v = float(np.mean(v[inside]))
             mean_s = float(np.mean(s[inside]))
 
-            # Prefer bright, low-saturation, centered circles
             score = mean_v - 0.8 * mean_s
 
             dist = np.sqrt((x - patch_cx) ** 2 + (y - patch_cy) ** 2)
@@ -138,21 +117,18 @@ def detect_chip_in_tile_patch(tile_patch_bgr):
     return best_circle, tile_patch_detected, chip_patch
 
 
-def detect_chips(image_bgr, centers, tile_margin_factor=0.60):
+def detect_chips(image_bgr, centers, resource_labels=None, tile_margin_factor=0.60):
     """
-    1) Take a fixed tile crop around each tile center -> tile_*.png
-    2) Run Hough circle detection inside that tile patch
-    3) Save drawn result as tile_*_detected.png
-    4) Save chip-only crop as tile_*_chip.png
-
-    Returns one result per tile center.
+    Detect chips only on non-desert tiles when resource_labels is provided.
     """
     tile_size = estimate_tile_size_from_centers(centers)
     detections = []
-
     detected_rs = []
 
     for tile_id, tx, ty in centers:
+        if resource_labels is not None and resource_labels[tile_id] == "Desert":
+            continue
+
         tile_patch, x_offset, y_offset = crop_tile_patch(
             image_bgr,
             tx,
@@ -205,7 +181,6 @@ def detect_chips(image_bgr, centers, tile_margin_factor=0.60):
             }
         )
 
-    # Optional normalization of displayed radii so overlays look consistent
     if detected_rs:
         avg_r = int(round(np.mean(detected_rs)))
         avg_inner = int(round(avg_r * 0.78))
@@ -219,12 +194,6 @@ def detect_chips(image_bgr, centers, tile_margin_factor=0.60):
 
 
 def save_chip_debug_patches(chips, save_dir):
-    """
-    Save:
-      - tile_*.png          = centered tile crop
-      - tile_*_detected.png = centered tile crop with detected circle
-      - tile_*_chip.png     = chip-only crop from detected circle
-    """
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -251,12 +220,13 @@ def assign_chips_to_tiles(chips, labels):
     """
     assignments = []
 
-    for chip, label in zip(chips, labels):
-        if label == "Desert":
+    for chip in chips:
+        tile_id = chip["tile_id"]
+        if labels[tile_id] == "Desert":
             continue
 
         item = dict(chip)
-        item["label"] = label
+        item["label"] = labels[tile_id]
         assignments.append(item)
 
     return assignments
@@ -264,15 +234,11 @@ def assign_chips_to_tiles(chips, labels):
 
 def draw_chips(image_bgr, chips):
     """
-    Draw chip detections for all tiles.
-    Green = detected circle
-    Yellow = inner crop radius
-    Orange = fallback when not detected
+    Draw chip detections without tile-id text.
     """
     img = image_bgr.copy()
 
     for item in chips:
-        tile_id = item["tile_id"]
         x = item["chip_x"]
         y = item["chip_y"]
         r_detected = item["chip_r_detected"]
@@ -283,49 +249,5 @@ def draw_chips(image_bgr, chips):
         cv2.circle(img, (x, y), r_detected, color, 2)
         cv2.circle(img, (x, y), r_inner, (0, 255, 255), 1)
         cv2.circle(img, (x, y), 3, (0, 0, 255), -1)
-
-        cv2.putText(
-            img,
-            str(tile_id),
-            (x + 5, y - 5),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-    return img
-
-
-def draw_chip_tile_assignments(image_bgr, assignments):
-    """
-    Draw final chip assignments on non-desert tiles only.
-    """
-    img = image_bgr.copy()
-
-    for item in assignments:
-        tile_id = item["tile_id"]
-        x = item["chip_x"]
-        y = item["chip_y"]
-        r_detected = item["chip_r_detected"]
-        r_inner = item["chip_r"]
-
-        color = (0, 255, 0) if item["detected"] else (0, 128, 255)
-
-        cv2.circle(img, (x, y), r_detected, color, 2)
-        cv2.circle(img, (x, y), r_inner, (0, 255, 255), 1)
-        cv2.circle(img, (x, y), 3, (0, 0, 255), -1)
-
-        cv2.putText(
-            img,
-            f"T{tile_id}",
-            (x + 5, y - 5),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
 
     return img

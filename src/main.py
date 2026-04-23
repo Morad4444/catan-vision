@@ -1,8 +1,13 @@
-from config import BOARD_EMPTY_IMAGE, BOARD_NUMBERS_IMAGE, BOARD_PIECES_IMAGE, OUTPUT_DIR
-from utils import ensure_dir, load_image, save_image
-from pathlib import Path
-from number_detection import save_chip_preprocessing_debug
+from __future__ import annotations
 
+import traceback
+import time
+from pathlib import Path
+import cv2
+import numpy as np
+
+from config import CAMERA_INDEX, WINDOW_NAME
+from utils import put_lines
 from board_detection import (
     detect_board_contour,
     approximate_polygon,
@@ -10,205 +15,302 @@ from board_detection import (
     order_hexagon_points,
     set_debug_prefix,
     draw_contour,
-    draw_points,
-    draw_hexagon_diagonals,
     generate_catan_tile_centers_from_hex,
-    draw_tile_centers,
     normalize_hexagon,
 )
-
-from tile_classification import (
-    crop_tile,
-    score_tile,
-    assign_resources_with_counts,
-    draw_tile_labels,
+from tile_classification import classify_resources, draw_tile_labels
+from chip_detection import detect_chips, assign_chips_to_tiles, draw_chips, save_chip_debug_patches
+from number_detection import (
+    generate_random_number_layout,
+    create_manual_board_state,
+    analyze_chip_identities,
+    detect_pair_swaps,
+    apply_detected_swaps,
+    print_swap_detected,
+    refresh_pending_reference_edges,
 )
 
-from chip_detection import (
-    detect_chips,
-    assign_chips_to_tiles,
-    draw_chips,
-    draw_chip_tile_assignments,
-    save_chip_debug_patches,
-)
+SIDEBAR_WIDTH = 430
+CHIP_DEBUG_DIR = Path("data/output/chip_debug_live")
+STATE_DIR = Path("data/output/board_state_live")
 
 
+def open_camera(index: int):
+    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {index}")
+    return cap
 
 
-from piece_detection import (
-    estimate_tile_size_from_centers,
-    generate_tile_corners_from_centers,
-    analyze_corner_colors,
-    detect_houses_from_corner_hsv,
-    print_detected_houses,
-    print_detected_house_points,
-    draw_detected_houses,
-    draw_corner_analysis,
-)
+def crop_live_roi(frame):
+    h, w = frame.shape[:2]
+    return frame.copy(), (0, 0, w, h)
 
 
-BOARD_DEBUG_DIR = OUTPUT_DIR / "board_debug"
-PIECES_DEBUG_DIR = OUTPUT_DIR / "pieces_debug"
-
-
-def process_board_geometry(image_bgr, prefix: str):
+def process_board_geometry(image_bgr, prefix="live_preview"):
     set_debug_prefix(prefix)
     contour = detect_board_contour(image_bgr)
     polygon = approximate_polygon(contour, image_bgr)
-
-    if len(polygon) != 6:
-        raise RuntimeError(f"{prefix}: expected 6 polygon points, got {len(polygon)}")
-
     points = polygon_to_points(polygon)
     ordered_points = order_hexagon_points(points, image_bgr)
-
-    hex_img = draw_contour(image_bgr, ordered_points)
-    hex_img = draw_points(hex_img, ordered_points)
-    save_image(BOARD_DEBUG_DIR / f"{prefix}_outer_hex.png", hex_img)
-
     normalized_img, normalized_points = normalize_hexagon(image_bgr, ordered_points)
-    save_image(BOARD_DEBUG_DIR / f"{prefix}_normalized_hex.png", normalized_img)
-    save_image(
-        BOARD_DEBUG_DIR / f"{prefix}_normalized_diagonals.png",
-        draw_hexagon_diagonals(normalized_img, normalized_points),
-    )
-
     centers = generate_catan_tile_centers_from_hex(normalized_points, normalized_img)
+    return {
+        "contour": contour,
+        "ordered_points": ordered_points,
+        "normalized_img": normalized_img,
+        "normalized_points": normalized_points,
+        "centers": centers,
+    }
 
-    centers_img = draw_tile_centers(normalized_img, centers)
-    centers_img = draw_contour(centers_img, normalized_points)
-    save_image(BOARD_DEBUG_DIR / f"{prefix}_tile_centers.png", centers_img)
 
-    return normalized_img, normalized_points, centers
+def polygon_mean_point(points):
+    pts = np.asarray(points, dtype=np.float32)
+    return np.mean(pts, axis=0)
+
+
+def polygon_average_corner_shift(poly_a, poly_b):
+    a = np.asarray(poly_a, dtype=np.float32)
+    b = np.asarray(poly_b, dtype=np.float32)
+    return float(np.mean(np.linalg.norm(a - b, axis=1)))
+
+
+def accept_new_geometry(new_geom, last_good_geom, max_center_shift=55.0, max_corner_shift=70.0):
+    if last_good_geom is None:
+        return True
+
+    prev_poly = last_good_geom["ordered_points"]
+    new_poly = new_geom["ordered_points"]
+
+    prev_center = polygon_mean_point(prev_poly)
+    new_center = polygon_mean_point(new_poly)
+
+    center_shift = float(np.linalg.norm(new_center - prev_center))
+    corner_shift = polygon_average_corner_shift(prev_poly, new_poly)
+
+    return center_shift <= max_center_shift and corner_shift <= max_corner_shift
+
+
+def stabilize_geometry(frame, last_good_geom):
+    roi, roi_box = crop_live_roi(frame)
+
+    try:
+        candidate = process_board_geometry(roi)
+        if accept_new_geometry(candidate, last_good_geom):
+            return {"geom": candidate, "status": "fresh", "roi_box": roi_box}
+
+        if last_good_geom is not None:
+            return {"geom": last_good_geom, "status": "held_last_good", "roi_box": roi_box}
+
+        raise RuntimeError("Board jump rejected and no previous stable board exists.")
+
+    except Exception as exc:
+        if last_good_geom is not None:
+            return {"geom": last_good_geom, "status": f"fallback_after_error: {exc}", "roi_box": roi_box}
+        raise
+
+
+def make_display_canvas(board_img, lines, status_color=(255, 255, 255)):
+    h, w = board_img.shape[:2]
+    canvas = np.zeros((h, w + SIDEBAR_WIDTH, 3), dtype=np.uint8)
+    canvas[:, SIDEBAR_WIDTH:] = board_img
+    cv2.line(canvas, (SIDEBAR_WIDTH - 1, 0), (SIDEBAR_WIDTH - 1, h - 1), (80, 80, 80), 1)
+
+    panel = canvas[:, :SIDEBAR_WIDTH]
+    put_lines(
+        panel,
+        lines,
+        origin=(18, 36),
+        line_height=34,
+        scale=0.85,
+        thickness=2,
+        color=status_color,
+        bg=False,
+    )
+    return canvas
 
 
 def main():
-    ensure_dir(OUTPUT_DIR)
+    CHIP_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-    image_empty = load_image(BOARD_EMPTY_IMAGE)
-    normalized_empty, ordered_empty, centers_empty = process_board_geometry(image_empty, "empty")
+    cap = open_camera(CAMERA_INDEX)
 
-    print("\nEmpty image tile centers:")
-    for tile_id, x, y in centers_empty:
-        print(f"Tile {tile_id}: x={x}, y={y}")
+    last_good_geom = None
+    frozen_labels = None
+    number_map = None
+    board_state = None
 
-    all_scores = []
-    print("\nResource scores:")
-    for tile_id, x, y in centers_empty:
-        tile_patch = crop_tile(normalized_empty, x, y, size=50)
-        scores = score_tile(tile_patch)
-        all_scores.append(scores)
+    consecutive_good_frames = 0
+    min_good_frames = 5
+    last_message = "waiting"
 
-        top3 = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
-        top_text = ", ".join([f"{name}={score:.1f}" for name, score in top3])
-        print(f"Tile {tile_id}: {top_text}")
+    monitor_mode = False
+    monitor_start_time = 0.0
+    monitor_warmup_seconds = 1.5
+    last_swap_tiles = []
 
-    labels = assign_resources_with_counts(all_scores)
+    print("Controls:")
+    print("  R = re-detect resources + reroll legal numbers")
+    print("  N = capture manually placed chips and start swap monitoring")
+    print("  Q or ESC = quit")
 
-    print("\nFinal resource labels:")
-    for (tile_id, _, _), label in zip(centers_empty, labels):
-        print(f"Tile {tile_id}: {label}")
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            continue
 
-    labeled_img = draw_tile_labels(
-        draw_tile_centers(normalized_empty, centers_empty),
-        centers_empty,
-        labels,
-    )
-    labeled_img = draw_contour(labeled_img, ordered_empty)
-    save_image(OUTPUT_DIR / "empty_resource_labels.png", labeled_img)
+        key = cv2.waitKey(1) & 0xFF
 
-    image_numbers = load_image(BOARD_NUMBERS_IMAGE)
-    normalized_numbers, ordered_numbers, centers_numbers = process_board_geometry(image_numbers, "numbers")
+        try:
+            stable = stabilize_geometry(frame=frame, last_good_geom=last_good_geom)
 
-    print("\nNumbers image tile centers:")
-    for tile_id, x, y in centers_numbers:
-        print(f"Tile {tile_id}: x={x}, y={y}")
+            geom = stable["geom"]
+            normalized = geom["normalized_img"]
+            centers = geom["centers"]
 
-    chips = detect_chips(normalized_numbers, centers_numbers)
-    
-    save_chip_debug_patches(chips, OUTPUT_DIR / "chip_debug")
+            if stable["status"] == "fresh":
+                consecutive_good_frames += 1
+                last_good_geom = geom
+            else:
+                consecutive_good_frames = max(0, consecutive_good_frames - 1)
 
-    print("\nChip detections:")
-    for item in chips:
-        print(
-            f"Tile {item['tile_id']}: "
-            f"center=({item['tile_x']}, {item['tile_y']}), "
-            f"chip=({item['chip_x']}, {item['chip_y']}), "
-            f"r_detected={item['chip_r_detected']}, "
-            f"r_inner={item['chip_r']}, "
-            f"detected={item['detected']}"
-        )
+            if frozen_labels is None and consecutive_good_frames >= min_good_frames:
+                frozen_labels, _, _ = classify_resources(normalized, centers)
+                number_map = generate_random_number_layout(centers, frozen_labels)
+                last_message = "resources locked"
 
-    chips_img = draw_chips(normalized_numbers, chips)
-    chips_img = draw_contour(chips_img, ordered_numbers)
-    save_image(OUTPUT_DIR / "numbers_chip_detections.png", chips_img)
+            overlay = normalized.copy()
 
-    assignments = assign_chips_to_tiles(chips, labels)
+            if frozen_labels is not None and number_map is not None:
+                overlay = draw_tile_labels(overlay, centers, frozen_labels, numbers=number_map)
 
-    save_chip_preprocessing_debug(assignments, OUTPUT_DIR / "chip_preprocess_debug")
+            if monitor_mode and frozen_labels is not None and number_map is not None and board_state is not None:
+                chips = detect_chips(normalized, centers, resource_labels=frozen_labels)
+                assignments = assign_chips_to_tiles(chips, frozen_labels)
+                overlay = draw_chips(overlay, chips)
 
+                if time.time() - monitor_start_time >= monitor_warmup_seconds:
+                    identity_report = analyze_chip_identities(
+                        assignments,
+                        board_state,
+                        debug_dir=STATE_DIR,
+                    )
 
+                    swaps = detect_pair_swaps(
+                        identity_report,
+                        board_state,
+                        debug_dir=STATE_DIR,
+                    )
 
-    print("\nFinal chip assignments (non-desert only):")
-    for item in assignments:
-        print(
-            f"Tile {item['tile_id']} ({item['label']}): "
-            f"chip=({item['chip_x']}, {item['chip_y']}), "
-            f"r={item['chip_r']}, detected={item['detected']}"
-        )
+                    applied = apply_detected_swaps(board_state, swaps, STATE_DIR)
 
-    assign_img = draw_chip_tile_assignments(normalized_numbers, assignments)
-    assign_img = draw_contour(assign_img, ordered_numbers)
-    
-    save_image(OUTPUT_DIR / "numbers_chip_assignments.png", assign_img)
+                    refresh_done = refresh_pending_reference_edges(
+                        assignments,
+                        board_state,
+                        STATE_DIR,
+                    )
 
-    print("\nSaved outputs in:")
-    print(OUTPUT_DIR)
+                    if applied:
+                        number_map = dict(board_state["number_map"])
+                        last_swap_tiles = [(sw["tile_a"], sw["tile_b"]) for sw in applied]
+                        last_message = ", ".join([f"swap {sw['number_a']}<->{sw['number_b']}" for sw in applied])
+                        print_swap_detected(applied)
+                    else:
+                        if refresh_done:
+                            last_message = "references refreshed"
+                        else:
+                            last_message = "monitoring"
+                        last_swap_tiles = []
+                else:
+                    last_message = "monitor warmup"
 
-    # Analyze tile corners
-    image_pieces = load_image(BOARD_PIECES_IMAGE)
-    normalized_pieces, ordered_pieces, centers_pices = process_board_geometry(image_pieces, "pieces")
+            if last_swap_tiles:
+                for a, b in last_swap_tiles:
+                    for tile_id in (a, b):
+                        _, x, y = centers[tile_id]
+                        cv2.circle(overlay, (x, y), 42, (0, 255, 255), 3)
 
-    tile_size = estimate_tile_size_from_centers(centers_pices)
-    tile_corners = generate_tile_corners_from_centers(centers_pices, tile_size)
-    corner_samples = analyze_corner_colors(normalized_pieces, tile_corners)
-    detected_houses, house_thresholds = detect_houses_from_corner_hsv(corner_samples)
-    print_detected_houses(detected_houses, house_thresholds)
-    print_detected_house_points(detected_houses)
+            overlay = draw_contour(overlay, geom["normalized_points"])
 
-    detected_houses_img = draw_detected_houses(normalized_pieces, detected_houses)
-    detected_houses_img = draw_contour(detected_houses_img, ordered_pieces)
-    save_image(PIECES_DEBUG_DIR / "detected_houses.png", detected_houses_img)
+            lines = [
+                "Catan number-chip monitor:",
+                "Board resources are fixed.",
+                "Numbers are generated legally.",
+                "",
+                "Press N after you place chips.",
+                "Press R to re-detect resources",
+                "and reroll numbers.",
+                "",
+                f"Stable frames: {consecutive_good_frames}/{min_good_frames}",
+                f"Board source: {stable['status']}",
+                f"Mode: {'monitor' if monitor_mode else 'preview'}",
+                f"Status: {last_message}",
+            ]
+            canvas = make_display_canvas(overlay, lines)
+            cv2.imshow(WINDOW_NAME, canvas)
 
-    # Draw and save corner analysis image
-    corner_analysis_img = draw_corner_analysis(
-        normalized_pieces,
-        tile_corners,
-        detected_houses=detected_houses,
-    )
-    corner_analysis_img = draw_contour(corner_analysis_img, ordered_pieces)
-    save_image(OUTPUT_DIR / "corner_analysis.png", corner_analysis_img)
-    save_image(PIECES_DEBUG_DIR / "corner_analysis.png", corner_analysis_img)
+            if key == ord("r"):
+                if consecutive_good_frames >= min_good_frames:
+                    frozen_labels, _, _ = classify_resources(normalized, centers)
+                    number_map = generate_random_number_layout(centers, frozen_labels)
+                    board_state = None
+                    monitor_mode = False
+                    last_swap_tiles = []
+                    last_message = "resources re-detected and numbers rerolled"
+                else:
+                    last_message = "wait for stable board first"
 
-#    # Process board_pieces.png
-#    image_pieces = load_image(BOARD_PIECES_IMAGE)
-#    # Use the same outer points as empty for normalization, since board is the same
-#    normalized_pieces, _ = normalize_hexagon(image_pieces, ordered_empty)
-#    save_image(OUTPUT_DIR / f"pieces_normalized_hex.png", normalized_pieces)
-#
-#    # Use centers from empty, assuming same board layout
-#    centers_pieces = centers_empty
-#
-#    # Analyze corners for pieces
-#    tile_size_pieces = estimate_tile_size_from_centers(centers_pieces)
-#    tile_corners_pieces = generate_tile_corners_from_centers(centers_pieces, tile_size_pieces)
-#    analyze_corner_colors(normalized_pieces, tile_corners_pieces)
-#
-#    # Draw and save corner analysis for pieces
-#    corner_analysis_pieces_img = draw_corner_analysis(normalized_pieces, tile_corners_pieces)
-#    corner_analysis_pieces_img = draw_contour(corner_analysis_pieces_img, ordered_empty)
-#    save_image(OUTPUT_DIR / "pieces_corner_analysis.png", corner_analysis_pieces_img)
+            elif key == ord("n"):
+                if frozen_labels is None or number_map is None:
+                    last_message = "wait for board/resources first"
+                elif consecutive_good_frames < min_good_frames:
+                    last_message = "wait for stable board first"
+                else:
+                    chips = detect_chips(normalized, centers, resource_labels=frozen_labels)
+                    assignments = assign_chips_to_tiles(chips, frozen_labels)
+
+                    valid_chip_count = sum(1 for x in assignments if x.get("chip_patch") is not None)
+                    if valid_chip_count < 10:
+                        last_message = f"not enough chips detected yet ({valid_chip_count})"
+                    else:
+                        save_chip_debug_patches(chips, CHIP_DEBUG_DIR)
+                        board_state = create_manual_board_state(assignments, number_map, STATE_DIR)
+                        monitor_mode = True
+                        monitor_start_time = time.time()
+                        last_swap_tiles = []
+                        last_message = "chip references captured"
+
+        except Exception as exc:
+            error_frame = frame.copy()
+            put_lines(
+                error_frame,
+                [
+                    "Board not ready",
+                    str(exc),
+                    "Move camera closer.",
+                    "Keep full board visible.",
+                    "Reduce shadows and reflections.",
+                ],
+                origin=(20, 40),
+                line_height=30,
+                scale=0.8,
+                thickness=2,
+            )
+            cv2.imshow(WINDOW_NAME, error_frame)
+
+        if key in (ord("q"), 27):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        raise
