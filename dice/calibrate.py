@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from dice.app import open_camera
+from Code.app import open_camera
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -144,7 +144,7 @@ def _draw_overlay(frame: np.ndarray) -> np.ndarray:
 def main() -> None:
     global _current_die, _current_white_face
 
-    capture, cam_idx = open_camera(0, 1280, 720, "Logitech C270")
+    capture, cam_idx = open_camera(0, 1280, 720, "HD USB Camera")
     if not capture.isOpened():
         raise RuntimeError("Could not open the webcam.")
 
