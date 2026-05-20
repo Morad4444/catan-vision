@@ -40,6 +40,18 @@ def crop_tile_patch(image_bgr, center_x, center_y, tile_size, margin_factor=0.60
     return crop_center_patch(image_bgr, center_x, center_y, half)
 
 
+def crop_chip_patch_by_circle(image_bgr, chip_x, chip_y, chip_r):
+    h, w = image_bgr.shape[:2]
+    r = int(max(6, round(chip_r)))
+
+    x1 = max(0, int(chip_x - r))
+    y1 = max(0, int(chip_y - r))
+    x2 = min(w, int(chip_x + r))
+    y2 = min(h, int(chip_y + r))
+
+    return image_bgr[y1:y2, x1:x2].copy()
+
+
 def detect_chip_in_tile_patch(tile_patch_bgr):
     img = tile_patch_bgr.copy()
     h, w = img.shape[:2]
@@ -48,17 +60,17 @@ def detect_chip_in_tile_patch(tile_patch_bgr):
         return None, img, None
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (9, 9), 2)
+    gray_blur = cv2.GaussianBlur(gray, (9, 9), 2)
 
     circles = cv2.HoughCircles(
-        gray,
+        gray_blur,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
         minDist=max(18, min(h, w) // 4),
         param1=100,
-        param2=18,
-        minRadius=max(10, int(min(h, w) * 0.10)),
-        maxRadius=max(20, int(min(h, w) * 0.28)),
+        param2=14,  # lower than before, so weak chip circles are also found
+        minRadius=max(8, int(min(h, w) * 0.08)),
+        maxRadius=max(22, int(min(h, w) * 0.34)),
     )
 
     best_circle = None
@@ -88,8 +100,10 @@ def detect_chip_in_tile_patch(tile_patch_bgr):
             mean_v = float(np.mean(v[inside]))
             mean_s = float(np.mean(s[inside]))
 
+            # white chips: bright and low saturation
             score = mean_v - 0.8 * mean_s
 
+            # prefer circles close to tile center
             dist = np.sqrt((x - patch_cx) ** 2 + (y - patch_cy) ** 2)
             score -= 0.35 * dist
 
@@ -120,10 +134,19 @@ def detect_chip_in_tile_patch(tile_patch_bgr):
 def detect_chips(image_bgr, centers, resource_labels=None, tile_margin_factor=0.60):
     """
     Detect chips only on non-desert tiles when resource_labels is provided.
+
+    Important behavior:
+    If HoughCircles fails on a tile, we still create a fallback chip patch from
+    the tile center. This prevents N from failing only because one white circle
+    was not perfectly detected. The fallback patch is enough for your edge/Dice
+    swap tracking.
     """
     tile_size = estimate_tile_size_from_centers(centers)
     detections = []
     detected_rs = []
+
+    fallback_r_detected = int(round(tile_size * 0.24))
+    fallback_r_inner = int(round(fallback_r_detected * 0.78))
 
     for tile_id, tx, ty in centers:
         if resource_labels is not None and resource_labels[tile_id] == "Desert":
@@ -140,19 +163,43 @@ def detect_chips(image_bgr, centers, resource_labels=None, tile_margin_factor=0.
         best_circle, tile_patch_detected, chip_patch = detect_chip_in_tile_patch(tile_patch)
 
         if best_circle is None:
-            fallback_r = int(round(tile_size * 0.22))
+            # fallback: use the known tile center as chip center
+            chip_x = int(tx)
+            chip_y = int(ty)
+            chip_patch = crop_chip_patch_by_circle(
+                image_bgr,
+                chip_x,
+                chip_y,
+                fallback_r_inner,
+            )
+
+            cv2.circle(
+                tile_patch_detected,
+                (tile_patch_detected.shape[1] // 2, tile_patch_detected.shape[0] // 2),
+                fallback_r_detected,
+                (0, 128, 255),
+                2,
+            )
+            cv2.circle(
+                tile_patch_detected,
+                (tile_patch_detected.shape[1] // 2, tile_patch_detected.shape[0] // 2),
+                2,
+                (0, 0, 255),
+                -1,
+            )
+
             detections.append(
                 {
                     "tile_id": tile_id,
                     "tile_x": tx,
                     "tile_y": ty,
-                    "chip_x": int(tx),
-                    "chip_y": int(ty),
-                    "chip_r_detected": fallback_r,
-                    "chip_r": int(round(fallback_r * 0.78)),
+                    "chip_x": chip_x,
+                    "chip_y": chip_y,
+                    "chip_r_detected": fallback_r_detected,
+                    "chip_r": fallback_r_inner,
                     "detected": False,
                     "tile_patch": tile_patch,
-                    "chip_patch": None,
+                    "chip_patch": chip_patch,
                     "tile_patch_detected": tile_patch_detected,
                 }
             )
@@ -181,6 +228,7 @@ def detect_chips(image_bgr, centers, resource_labels=None, tile_margin_factor=0.
             }
         )
 
+    # Standardize radii only for drawing/tracking. Keep the actual chip_patch already cropped.
     if detected_rs:
         avg_r = int(round(np.mean(detected_rs)))
         avg_inner = int(round(avg_r * 0.78))
@@ -234,7 +282,8 @@ def assign_chips_to_tiles(chips, labels):
 
 def draw_chips(image_bgr, chips):
     """
-    Draw chip detections without tile-id text.
+    Green circle = Hough detected chip.
+    Orange circle = fallback center crop.
     """
     img = image_bgr.copy()
 

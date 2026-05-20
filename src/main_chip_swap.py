@@ -20,7 +20,10 @@ from board_detection import (
     generate_catan_tile_centers_from_hex,
 )
 
-from tile_classification import classify_resources, draw_tile_labels
+from tile_classification import (
+    classify_resources,
+    draw_tile_labels,
+)
 
 from chip_detection import (
     detect_chips,
@@ -29,7 +32,7 @@ from chip_detection import (
     save_chip_debug_patches,
 )
 
-from number_detection import (
+from number_detection_debug import (
     generate_random_number_layout,
     create_manual_board_state,
     analyze_chip_identities,
@@ -39,17 +42,11 @@ from number_detection import (
     refresh_pending_reference_edges,
 )
 
-from piece_detection import (
-    detect_settlements,
-    summarize_settlement_changes,
-    draw_detected_houses,
-)
-
 
 SIDEBAR_WIDTH = 430
 
-CHIP_DEBUG_DIR = Path("data/output/chip_debug_live")
-STATE_DIR = Path("data/output/board_state_live")
+CHIP_DEBUG_DIR = Path("data/output/chip_swap_debug")
+STATE_DIR = Path("data/output/board_state_chip_swap_debug")
 
 
 def open_camera(index: int):
@@ -64,15 +61,10 @@ def open_camera(index: int):
     return cap
 
 
-def crop_live_roi(frame):
-    h, w = frame.shape[:2]
-    return frame.copy(), (0, 0, w, h)
-
-
-def process_board_geometry(image_bgr, prefix="live_cached"):
+def process_board_geometry(image_bgr, prefix="chip_swap_debug"):
     """
-    Detect the board ONCE on the original camera frame.
-    No normalize_hexagon(), because that rotates/warps the board.
+    Detect board once on original frame.
+    No warp / no normalize_hexagon.
     """
     set_debug_prefix(prefix)
 
@@ -93,12 +85,10 @@ def process_board_geometry(image_bgr, prefix="live_cached"):
     }
 
 
-def crop_board_view(image_bgr, ordered_points, margin=230, target_height=700):
+def crop_board_view(image_bgr, ordered_points, margin=180, target_height=700):
     """
-    Crop display around cached board polygon.
-    Everything outside the hexagon becomes black.
-    This only affects the preview window.
-    Detection/tracking still uses the full camera frame.
+    Only for display.
+    Detection and tracking still use the full camera frame.
     """
     pts = np.asarray(ordered_points, dtype=np.float32)
 
@@ -137,13 +127,11 @@ def crop_board_view(image_bgr, ordered_points, margin=230, target_height=700):
     scale = target_height / float(ch)
     target_width = int(round(cw * scale))
 
-    zoomed = cv2.resize(
+    return cv2.resize(
         crop,
         (target_width, target_height),
         interpolation=cv2.INTER_LINEAR,
     )
-
-    return zoomed
 
 
 def make_display_canvas(board_img, lines, status_color=(255, 255, 255)):
@@ -176,9 +164,75 @@ def make_display_canvas(board_img, lines, status_color=(255, 255, 255)):
     return canvas
 
 
-def capture_board_from_frame(frame):
-    roi, _ = crop_live_roi(frame)
-    return process_board_geometry(roi, prefix="manual_capture")
+def capture_board_and_resources(frame):
+    geom = process_board_geometry(frame, prefix="chip_swap_capture")
+    centers = geom["centers"]
+
+    resource_labels, _, resource_features = classify_resources(
+        frame,
+        centers,
+    )
+
+    number_map = generate_random_number_layout(
+        centers,
+        resource_labels,
+    )
+
+    return geom, resource_labels, resource_features, number_map
+
+
+def print_resource_table(centers, resource_labels, number_map):
+    print("\n================ BOARD RESOURCE STATE ================")
+
+    for tile_id, _, _ in centers:
+        label = resource_labels[tile_id]
+        num = number_map.get(tile_id, "-")
+        print(f"tile {tile_id:02d}: {label:7s} number={num}")
+
+    print("======================================================\n")
+
+
+def start_chip_monitor(frame, centers, resource_labels, number_map):
+    chips = detect_chips(
+        frame,
+        centers,
+        resource_labels=resource_labels,
+    )
+
+    assignments = assign_chips_to_tiles(
+        chips,
+        resource_labels,
+    )
+
+    valid_chip_count = sum(
+        1
+        for item in assignments
+        if item.get("chip_patch") is not None
+    )
+
+    save_chip_debug_patches(
+        chips,
+        CHIP_DEBUG_DIR,
+    )
+
+    print(f"N pressed: chips detected = {valid_chip_count}")
+    print(f"assignments = {len(assignments)}")
+    print(f"chip debug saved to: {CHIP_DEBUG_DIR}")
+
+    if valid_chip_count < 10:
+        return None, chips, assignments, f"not enough chips detected ({valid_chip_count})"
+
+    board_state = create_manual_board_state(
+        assignments,
+        number_map,
+        STATE_DIR,
+    )
+
+    print(f"chip references saved to: {STATE_DIR}")
+    print("monitor started. Scores will print every 2 seconds.")
+    print("Swap two chips now. Avoid locked numbers: 2, 6, 8, 12.")
+
+    return board_state, chips, assignments, f"monitor started: {valid_chip_count} chips"
 
 
 def main():
@@ -187,34 +241,37 @@ def main():
 
     cap = open_camera(CAMERA_INDEX)
 
+    window_title = WINDOW_NAME + " - Chip Swap Debug"
+    cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
+
     geom = None
-    frozen_labels = None
+    resource_labels = None
+    resource_features = None
     number_map = None
     board_state = None
-
-    previous_houses = None
-    current_houses = []
-    settlement_changes = {
-        "new": [],
-        "kept": [],
-        "removed": [],
-    }
-
-    last_message = "press B to capture board"
 
     monitor_mode = False
     monitor_start_time = 0.0
     monitor_warmup_seconds = 1.5
 
+    last_message = "press B to capture board"
+    last_key = "none"
     last_swap_tiles = []
 
     print("Controls:")
-    print("  B = capture / recapture board geometry")
-    print("  R = re-detect resources + reroll legal numbers")
-    print("  N = capture chips + settlements and start monitoring")
+    print("  B = capture board + classify resources + generate numbers")
+    print("  N = capture chip references + start score monitor")
+    print("  R = re-capture resources/numbers using cached board")
+    print("  S = stop monitor")
     print("  Q or ESC = quit")
     print("")
-    print("Important: click the OpenCV window before pressing keys.")
+    print("Important:")
+    print("  1) Click the OpenCV window before pressing keys.")
+    print("  2) Press B first.")
+    print("  3) Put chips on board, then press N.")
+    print("  4) Scores print every 2 seconds after N.")
+    print("  5) This file imports tile_classification.py, not tile_classification_hsv_debug.py.")
+    print("")
 
     while True:
         ok, frame = cap.read()
@@ -223,52 +280,46 @@ def main():
             continue
 
         key = cv2.waitKey(1) & 0xFF
-        key_chr = chr(key).lower() if key not in (255, 0) else ""
+
+        key_chr = ""
+        if key not in (255, 0):
+            try:
+                key_chr = chr(key).lower()
+                last_key = key_chr
+                print(f"KEY pressed: {key_chr}")
+            except Exception:
+                last_key = str(key)
+                print(f"KEY pressed code: {key}")
 
         try:
-            if key_chr == "b":
-                geom = capture_board_from_frame(frame)
+            if key_chr == "q" or key == 27:
+                break
 
-                frozen_labels = None
-                number_map = None
+            if key_chr == "b":
+                geom, resource_labels, resource_features, number_map = capture_board_and_resources(frame)
+
                 board_state = None
                 monitor_mode = False
-
-                previous_houses = None
-                current_houses = []
-                settlement_changes = {
-                    "new": [],
-                    "kept": [],
-                    "removed": [],
-                }
-
                 last_swap_tiles = []
 
-                centers = geom["centers"]
+                print("B pressed: board captured, resources classified, numbers generated.")
+                print_resource_table(geom["centers"], resource_labels, number_map)
 
-                frozen_labels, _, _ = classify_resources(
-                    frame,
-                    centers,
-                )
-
-                number_map = generate_random_number_layout(
-                    centers,
-                    frozen_labels,
-                )
-
-                last_message = "board captured - resources detected"
-                print("B pressed: board captured and resources detected.")
+                last_message = "board captured - press N after chips are placed"
 
             if geom is None:
-                error_frame = frame.copy()
+                preview = frame.copy()
 
                 put_lines(
-                    error_frame,
+                    preview,
                     [
-                        "No board geometry yet.",
-                        "Press B to capture board.",
-                        "Then press N after chips/pieces are placed.",
+                        "Chip swap debug",
                         "",
+                        "No board captured yet.",
+                        "Click this window.",
+                        "Press B to capture board.",
+                        "",
+                        f"Last key: {last_key}",
                         f"Status: {last_message}",
                     ],
                     origin=(20, 40),
@@ -277,152 +328,89 @@ def main():
                     thickness=2,
                 )
 
-                cv2.imshow(WINDOW_NAME, error_frame)
-
-                if key_chr == "q" or key == 27:
-                    break
-
+                cv2.imshow(window_title, preview)
                 continue
 
             centers = geom["centers"]
             overlay = frame.copy()
 
             if key_chr == "r":
-                frozen_labels, _, _ = classify_resources(
+                resource_labels, _, resource_features = classify_resources(
                     frame,
                     centers,
                 )
 
                 number_map = generate_random_number_layout(
                     centers,
-                    frozen_labels,
+                    resource_labels,
                 )
 
                 board_state = None
                 monitor_mode = False
                 last_swap_tiles = []
 
-                previous_houses = None
-                current_houses = []
-                settlement_changes = {
-                    "new": [],
-                    "kept": [],
-                    "removed": [],
-                }
+                print("R pressed: resources re-classified and numbers regenerated.")
+                print_resource_table(centers, resource_labels, number_map)
 
-                last_message = "resources re-detected and numbers rerolled"
-                print("R pressed: resources re-detected and numbers rerolled.")
+                last_message = "resources/numbers reset - press N again"
+
+            elif key_chr == "s":
+                board_state = None
+                monitor_mode = False
+                last_swap_tiles = []
+                last_message = "monitor stopped"
+                print("S pressed: monitor stopped.")
 
             elif key_chr == "n":
-                print("N pressed")
-
-                if frozen_labels is None or number_map is None:
+                if resource_labels is None or number_map is None:
+                    print("N ignored: press B first.")
                     last_message = "press B first"
-                    print("N ignored: no frozen_labels or number_map yet.")
 
                 else:
-                    chips = detect_chips(
+                    board_state, chips, assignments, msg = start_chip_monitor(
                         frame,
                         centers,
-                        resource_labels=frozen_labels,
+                        resource_labels,
+                        number_map,
                     )
 
-                    assignments = assign_chips_to_tiles(
-                        chips,
-                        frozen_labels,
-                    )
+                    last_message = msg
 
-                    valid_chip_count = sum(
-                        1
-                        for item in assignments
-                        if item.get("chip_patch") is not None
-                    )
-
-                    current_houses, _, _ = detect_settlements(
-                        frame,
-                        centers,
-                    )
-
-                    previous_houses = current_houses
-                    settlement_changes = {
-                        "new": [],
-                        "kept": current_houses,
-                        "removed": [],
-                    }
-
-                    print(f"chips detected on N: {valid_chip_count}")
-
-                    save_chip_debug_patches(
-                        chips,
-                        CHIP_DEBUG_DIR,
-                    )
-
-                    if valid_chip_count < 10:
-                        last_message = f"N worked, but not enough chips detected ({valid_chip_count})"
-                        print(last_message)
-
-                    else:
-                        board_state = create_manual_board_state(
-                            assignments,
-                            number_map,
-                            STATE_DIR,
-                        )
-
+                    if board_state is not None:
                         monitor_mode = True
                         monitor_start_time = time.time()
                         last_swap_tiles = []
+                    else:
+                        monitor_mode = False
 
-                        last_message = (
-                            f"monitor started: {valid_chip_count} chips, "
-                            f"{len(current_houses)} settlements"
-                        )
-
-                        print(last_message)
-
-            if frozen_labels is not None and number_map is not None:
+            if resource_labels is not None and number_map is not None:
                 overlay = draw_tile_labels(
                     overlay,
                     centers,
-                    frozen_labels,
+                    resource_labels,
                     numbers=number_map,
                 )
 
             if (
                 monitor_mode
-                and frozen_labels is not None
-                and number_map is not None
                 and board_state is not None
+                and resource_labels is not None
+                and number_map is not None
             ):
                 chips = detect_chips(
                     frame,
                     centers,
-                    resource_labels=frozen_labels,
+                    resource_labels=resource_labels,
                 )
 
                 assignments = assign_chips_to_tiles(
                     chips,
-                    frozen_labels,
+                    resource_labels,
                 )
 
                 overlay = draw_chips(
                     overlay,
                     chips,
-                )
-
-                current_houses, _, _ = detect_settlements(
-                    frame,
-                    centers,
-                )
-
-                settlement_changes = summarize_settlement_changes(
-                    previous_houses,
-                    current_houses,
-                )
-
-                overlay = draw_detected_houses(
-                    overlay,
-                    current_houses,
-                    new_houses=settlement_changes["new"],
                 )
 
                 if time.time() - monitor_start_time >= monitor_warmup_seconds:
@@ -452,29 +440,20 @@ def main():
 
                     if applied:
                         number_map = dict(board_state["number_map"])
-
                         last_swap_tiles = [
                             (sw["tile_a"], sw["tile_b"])
                             for sw in applied
                         ]
 
-                        last_message = ", ".join(
-                            [
-                                f"swap {sw['number_a']}<->{sw['number_b']}"
-                                for sw in applied
-                            ]
-                        )
-
                         print_swap_detected(applied)
+                        last_message = "swap detected"
+
+                    elif refresh_done:
+                        last_message = "reference refreshed"
+                        last_swap_tiles = []
 
                     else:
-                        if refresh_done:
-                            last_message = "chip references refreshed"
-                        elif settlement_changes["new"]:
-                            last_message = f"new settlement: {len(settlement_changes['new'])}"
-                        else:
-                            last_message = "monitoring"
-
+                        last_message = "monitoring chip scores"
                         last_swap_tiles = []
 
                 else:
@@ -484,7 +463,6 @@ def main():
                 for a, b in last_swap_tiles:
                     for tile_id in (a, b):
                         _, x, y = centers[tile_id]
-
                         cv2.circle(
                             overlay,
                             (x, y),
@@ -498,56 +476,47 @@ def main():
                 geom["ordered_points"],
             )
 
-            if monitor_mode:
-                overlay = draw_chips(
-                    overlay,
-                    detect_chips(
-                        frame,
-                        centers,
-                        resource_labels=frozen_labels,
-                    ),
-                )
-
             zoomed_overlay = crop_board_view(
                 overlay,
                 geom["ordered_points"],
-                margin=20,
-                target_height=1100,
+                margin=180,
+                target_height=700,
             )
 
             lines = [
-                "Catan monitor:",
-                "Board geometry is cached.",
-                "No board rotation / no warp.",
-                "Preview is zoomed on board.",
-                "Outside board is black.",
+                "Chip Swap Debug:",
+                "Uses GOOD classifier.",
+                "Scores print every 2 sec.",
                 "",
                 "B = capture board",
-                "N = capture chips/pieces",
-                "R = reset resources/numbers",
+                "N = capture refs/start",
+                "R = reset resources",
+                "S = stop monitor",
                 "Q = quit",
                 "",
+                f"Last key: {last_key}",
                 f"Mode: {'monitor' if monitor_mode else 'preview'}",
-                f"Settlements: {len(current_houses)}",
-                f"New settlements: {len(settlement_changes['new'])}",
-                f"Removed settlements: {len(settlement_changes['removed'])}",
                 f"Status: {last_message}",
             ]
 
             canvas = make_display_canvas(zoomed_overlay, lines)
-            cv2.imshow(WINDOW_NAME, canvas)
+            cv2.imshow(window_title, canvas)
 
-        except Exception as exc:
+        except Exception:
+            traceback.print_exc()
+
             error_frame = frame.copy()
 
             put_lines(
                 error_frame,
                 [
-                    "Runtime error",
-                    str(exc),
+                    "Runtime error.",
+                    "See terminal traceback.",
                     "",
-                    "Press B to recapture board.",
-                    "Check terminal for traceback.",
+                    "Usually fix:",
+                    "1) Press B first.",
+                    "2) Check classifier files.",
+                    "3) Check chip_detection.py.",
                 ],
                 origin=(20, 40),
                 line_height=30,
@@ -555,11 +524,7 @@ def main():
                 thickness=2,
             )
 
-            cv2.imshow(WINDOW_NAME, error_frame)
-            traceback.print_exc()
-
-        if key_chr == "q" or key == 27:
-            break
+            cv2.imshow(window_title, error_frame)
 
     cap.release()
     cv2.destroyAllWindows()

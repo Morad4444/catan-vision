@@ -22,197 +22,308 @@ RESOURCE_COLORS_BGR = {
     "Desert": (180, 180, 180),
 }
 
-# Target HSV centers based on your live screenshots
-RESOURCE_HSV_CENTERS = {
-    "Ore":    {"h": 121.0, "s": 100.0, "v": 70.0},
-    "Brick":  {"h": 10.0,  "s": 82.0,  "v": 82.0},
-    "Grain":  {"h": 22.0,  "s": 92.0,  "v": 120.0},
-    "Lumber": {"h": 88.0,  "s": 82.0,  "v": 52.0},
-    "Wool":   {"h": 72.0,  "s": 100.0, "v": 95.0},
-    "Desert": {"h": 20.0,  "s": 55.0,  "v": 118.0},
-}
-
 
 def crop_tile(image_bgr, x, y, size=42):
     h, w = image_bgr.shape[:2]
-    x1 = max(0, x - size)
-    y1 = max(0, y - size)
-    x2 = min(w, x + size)
-    y2 = min(h, y + size)
+
+    x1 = max(0, int(x - size))
+    y1 = max(0, int(y - size))
+    x2 = min(w, int(x + size))
+    y2 = min(h, int(y + size))
+
     return image_bgr[y1:y2, x1:x2].copy()
 
 
-def _build_inner_mask(h: int, w: int, radius_scale: float = 0.30) -> np.ndarray:
+def build_inner_mask(h, w, radius_scale=0.30):
     yy, xx = np.mgrid[0:h, 0:w]
+
     cx = (w - 1) / 2.0
     cy = (h - 1) / 2.0
+
     r = min(h, w) * radius_scale
+
     return ((xx - cx) ** 2 + (yy - cy) ** 2) <= r * r
 
 
-def extract_tile_hsv(tile_patch: np.ndarray) -> dict:
+def extract_tile_hsv(tile_patch):
     hsv = cv2.cvtColor(tile_patch, cv2.COLOR_BGR2HSV)
+
     h, w = hsv.shape[:2]
 
-    mask = _build_inner_mask(h, w, radius_scale=0.30)
+    mask = build_inner_mask(h, w, radius_scale=0.30)
+
     vals = hsv[mask]
+
     if len(vals) == 0:
-        return {"h": 0.0, "s": 0.0, "v": 0.0}
+        vals = hsv.reshape(-1, 3)
 
     vals = vals.astype(np.float32)
 
+    # remove glare/shadows
     v_lo = np.percentile(vals[:, 2], 8)
     v_hi = np.percentile(vals[:, 2], 92)
+
     keep = (vals[:, 2] >= v_lo) & (vals[:, 2] <= v_hi)
+
     core = vals[keep] if np.count_nonzero(keep) >= 20 else vals
 
-    h_med = float(np.median(core[:, 0]))
-    s_med = float(np.median(core[:, 1]))
-    v_med = float(np.median(core[:, 2]))
+    h_val = float(np.median(core[:, 0]))
+    s_val = float(np.median(core[:, 1]))
+    v_val = float(np.median(core[:, 2]))
 
-    return {"h": h_med, "s": s_med, "v": v_med}
+    return {
+        "h": h_val,
+        "s": s_val,
+        "v": v_val,
+    }
 
 
-def classify_hsv_simple(h: float, s: float, v: float) -> str | None:
-    """
-    Rule-based HSV classification using the ranges visible in your screenshot.
-    Returns the resource name, or None if no rule matches.
-    """
-
-    # Ore: blue / purple mountains
-    if 100 <= h <= 112 and 30 <= s <= 60 and 130 <= v <= 160:
-        return "Ore"
-
-    # Lumber: darker green forest
-    elif 68 <= h <= 90 and 40 <= s <= 80 and 100 <= v <= 120:
-        return "Lumber"
-
-    # Wool: brighter green pasture
-    elif 55 <= h <= 66 and 60 <= s <= 85 and 128 <= v <= 155:
+def classify_hsv(h, s, v):
+    # ------------------------------------------------------------
+    # WOOL
+    # H: 39-40
+    # S: 176-190
+    # V: 145-154
+    # ------------------------------------------------------------
+    if (
+        37 <= h <= 42
+        and 165 <= s <= 205
+        and 138 <= v <= 160
+    ):
         return "Wool"
 
-    # Grain: yellow fields
-    elif 24 <= h <= 38 and 40 <= s <= 75 and 140 <= v <= 160:
+    # ------------------------------------------------------------
+    # LUMBER
+    # H: 37-39
+    # S: 144-148
+    # V: 79-99
+    # ------------------------------------------------------------
+    if (
+        35 <= h <= 41
+        and 130 <= s <= 160
+        and 70 <= v <= 115
+    ):
+        return "Lumber"
+
+    # ------------------------------------------------------------
+    # ORE
+    # H: 19-25
+    # S: 40-60
+    # V: 98-153
+    # ------------------------------------------------------------
+    if (
+        18 <= h <= 27
+        and 30 <= s <= 75
+        and 90 <= v <= 170
+    ):
+        return "Ore"
+
+    # ------------------------------------------------------------
+    # BRICK
+    # H: 16-17
+    # S: 191-214
+    # V: 123-135
+    # ------------------------------------------------------------
+    if (
+        14 <= h <= 19
+        and 175 <= s <= 225
+        and 110 <= v <= 145
+    ):
+        return "Brick"
+
+    # ------------------------------------------------------------
+    # GRAIN
+    # H: 22-23
+    # S: 135-204
+    # V: 164-190
+    # ------------------------------------------------------------
+    if (
+        20 <= h <= 25
+        and 120 <= s <= 220
+        and 155 <= v <= 205
+    ):
         return "Grain"
 
-    # Desert: beige / pale yellow, slightly darker than grain
-    elif 24 <= h <= 34 and 60 <= s <= 80 and 128 <= v <= 140:
+    # ------------------------------------------------------------
+    # DESERT
+    # H: 23
+    # S: 139
+    # V: 154
+    # ------------------------------------------------------------
+    if (
+        20 <= h <= 26
+        and 110 <= s <= 155
+        and 140 <= v <= 170
+    ):
         return "Desert"
-
-    # Brick: brown / reddish hills
-    elif 45 <= h <= 95 and 25 <= s <= 40 and 115 <= v <= 130:
-        return "Brick"
 
     return None
 
 
-def hsv_distance_to_label(h: float, s: float, v: float, label: str) -> float:
-    target = RESOURCE_HSV_CENTERS[label]
-
-    dh = abs(h - target["h"])
-    ds = abs(s - target["s"])
-    dv = abs(v - target["v"])
-
-    # Weighted distance
-    return 2.0 * dh + 0.35 * ds + 0.25 * dv
+def hsv_distance(h, s, v, target):
+    return (
+        abs(h - target["h"]) * 2.0
+        + abs(s - target["s"]) * 0.35
+        + abs(v - target["v"]) * 0.25
+    )
 
 
-def classify_resources(image_bgr: np.ndarray, centers: list, crop_size: int = 42):
-    """
-    Returns:
-        labels: final labels
-        raw_labels: direct rule labels, may contain None
-        features: per-tile HSV
-    """
+REFERENCE_VALUES = {
+    "Wool": {"h": 40, "s": 180, "v": 150},
+    "Lumber": {"h": 38, "s": 145, "v": 90},
+    "Ore": {"h": 22, "s": 50, "v": 125},
+    "Brick": {"h": 16, "s": 200, "v": 130},
+    "Grain": {"h": 23, "s": 180, "v": 175},
+    "Desert": {"h": 23, "s": 139, "v": 154},
+}
+
+
+def classify_resources(image_bgr, centers, crop_size=42):
     n = len(centers)
-    raw_labels: list[str | None] = [None] * n
-    features: list[dict] = [None] * n  # type: ignore[assignment]
 
-    assigned_counts = {name: 0 for name in RESOURCE_COUNTS}
-    missing_tile_ids: list[int] = []
+    labels = [None] * n
+    features = [None] * n
+
+    assigned_counts = {k: 0 for k in RESOURCE_COUNTS}
+    missing_tiles = []
 
     for tile_id, x, y in centers:
-        tile_patch = crop_tile(image_bgr, x, y, size=crop_size)
+        tile_patch = crop_tile(
+            image_bgr,
+            x,
+            y,
+            size=crop_size,
+        )
+
         hsv = extract_tile_hsv(tile_patch)
+
         features[tile_id] = hsv
 
-        label = classify_hsv_simple(hsv["h"], hsv["s"], hsv["v"])
-        raw_labels[tile_id] = label
+        label = classify_hsv(
+            hsv["h"],
+            hsv["s"],
+            hsv["v"],
+        )
+
+        labels[tile_id] = label
 
         if label is None:
-            missing_tile_ids.append(tile_id)
+            missing_tiles.append(tile_id)
         else:
             assigned_counts[label] += 1
 
-    remaining_counts = {
-        name: RESOURCE_COUNTS[name] - assigned_counts[name]
-        for name in RESOURCE_COUNTS
+    remaining = {
+        k: RESOURCE_COUNTS[k] - assigned_counts[k]
+        for k in RESOURCE_COUNTS
     }
 
-    final_labels = raw_labels[:]
-
-    # Fallback score assignment only for missing tiles
-    for tile_id in missing_tile_ids:
+    # fallback classification
+    for tile_id in missing_tiles:
         hsv = features[tile_id]
-        h, s, v = hsv["h"], hsv["s"], hsv["v"]
 
         best_label = None
-        best_score = float("inf")
+        best_score = 1e9
 
-        for label, count_left in remaining_counts.items():
-            if count_left <= 0:
+        for label, remaining_count in remaining.items():
+            if remaining_count <= 0:
                 continue
 
-            score = hsv_distance_to_label(h, s, v, label)
+            score = hsv_distance(
+                hsv["h"],
+                hsv["s"],
+                hsv["v"],
+                REFERENCE_VALUES[label],
+            )
+
             if score < best_score:
                 best_score = score
                 best_label = label
 
         if best_label is None:
-            # safety fallback
-            for label, count_left in remaining_counts.items():
-                if count_left > 0:
-                    best_label = label
-                    break
+            continue
 
-        final_labels[tile_id] = best_label
-        remaining_counts[best_label] -= 1  # type: ignore[index]
+        labels[tile_id] = best_label
+        remaining[best_label] -= 1
 
-    return final_labels, raw_labels, features
+    return labels, labels, features
 
 
 def draw_tile_labels(
-    image_bgr: np.ndarray,
-    centers: list,
-    labels: list[str],
-    numbers: dict | None = None,
+    image_bgr,
+    centers,
+    labels,
+    numbers=None,
 ):
     img = image_bgr.copy()
 
+    number_scale = 0.34
+    number_thickness_outer = 1
+    number_thickness_inner = 1
+
+    label_scale = 0.22
+    label_thickness = 1
+
     for tile_id, x, y in centers:
         label = labels[tile_id]
-        color = RESOURCE_COLORS_BGR.get(label, (255, 255, 255))
+
+        color = RESOURCE_COLORS_BGR.get(
+            label,
+            (255, 255, 255),
+        )
 
         if numbers is not None and tile_id in numbers:
             txt = str(numbers[tile_id])
-            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.95, 3)
-            tx = int(x - tw / 2)
-            ty = int(y + th / 2 - 6)
-            cv2.putText(img, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (255, 255, 255), 3, cv2.LINE_AA)
-            cv2.putText(img, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 0, 0), 1, cv2.LINE_AA)
 
-        label_y = int(y + 34)
-        if label == "Desert":
-            label_y = int(y + 28)
+            (tw, th), _ = cv2.getTextSize(
+                txt,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                number_scale,
+                number_thickness_outer,
+            )
+
+            tx = int(x - tw / 2)
+            ty = int(y - 5)
+
+            cv2.putText(
+                img,
+                txt,
+                (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                number_scale,
+                (255, 255, 255),
+                number_thickness_outer,
+                cv2.LINE_AA,
+            )
+
+            cv2.putText(
+                img,
+                txt,
+                (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                number_scale,
+                (0, 0, 0),
+                number_thickness_inner,
+                cv2.LINE_AA,
+            )
+
+        (lw, _), _ = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            label_scale,
+            label_thickness,
+        )
+
+        lx = int(x - lw / 2)
+        ly = int(y + 16)
 
         cv2.putText(
             img,
             label,
-            (int(x - 40), label_y),
+            (lx, ly),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.56,
+            label_scale,
             color,
-            2,
+            label_thickness,
             cv2.LINE_AA,
         )
 

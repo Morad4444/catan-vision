@@ -308,7 +308,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     detector = DiceDetector()
-    capture, selected_index = open_camera(args.camera_index, args.width, args.height, args.camera_name)
+    capture, selected_index = open_camera(1, args.width, args.height, args.camera_name)
 
     if not capture.isOpened():
         raise RuntimeError("Could not open the webcam. Check the USB connection and camera index.")

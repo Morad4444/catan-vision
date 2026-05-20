@@ -49,161 +49,68 @@ def detect_board_contour(image_bgr):
 
 
 def approximate_polygon(contour, image_bgr):
-    hull = cv2.convexHull(contour, returnPoints=True).reshape(-1, 2).astype(np.float32)
+    """
+    Robust outer-board hexagon approximation.
 
-    def approximate_hull_polygon(points):
-        hull_contour = points.reshape(-1, 1, 2).astype(np.float32)
-        perimeter = cv2.arcLength(hull_contour, True)
+    This version does NOT fit extra RANSAC lines. The previous line fitting could
+    create a wrong triangle / crossed polygon when one blue edge was partially
+    hidden or when the mask included reflections/background. Here we use only the
+    largest blue contour hull and choose six real hull points.
+    """
+    hull = cv2.convexHull(contour, returnPoints=True)
+    hull_contour = hull.astype(np.float32)
+    perimeter = cv2.arcLength(hull_contour, True)
 
-        best_polygon = None
-        best_diff = float("inf")
-
-        for factor in np.linspace(0.0025, 0.08, 64):
-            epsilon = factor * perimeter
-            polygon = cv2.approxPolyDP(hull_contour, epsilon, True)
-            diff = abs(len(polygon) - 6)
-
-            if diff < best_diff:
-                best_diff = diff
-                best_polygon = polygon
-
-            if len(polygon) == 6:
-                break
-
-        if best_polygon is None or len(best_polygon) != 6:
-            found = 0 if best_polygon is None else len(best_polygon)
-            raise RuntimeError(f"Only found {found} hull polygon points, expected 6.")
-
-        return best_polygon.reshape(-1, 2).astype(np.float32)
-
-    def fit_lines_ransac(points, num_lines=6, threshold=1.0, iterations=300, min_remaining=4):
-        rng = np.random.default_rng(0)
-        remaining = points.copy()
-        lines = []
-
-        for _ in range(num_lines):
-            if len(remaining) < min_remaining:
-                break
-
-            best_line = None
-            best_inliers = np.empty((0, 2), dtype=np.float32)
-
-            for _ in range(iterations):
-                if len(remaining) < 2:
-                    break
-
-                i, j = rng.choice(len(remaining), 2, replace=False)
-                p1, p2 = remaining[i], remaining[j]
-
-                d = p2 - p1
-                norm = np.linalg.norm(d)
-                if norm < 1e-6:
-                    continue
-                d = d / norm
-
-                diff = remaining - p1
-                dist = np.abs(diff[:, 0] * d[1] - diff[:, 1] * d[0])
-
-                inliers = remaining[dist < threshold]
-
-                if len(inliers) > len(best_inliers):
-                    best_inliers = inliers
-                    best_line = (p1, d)
-
-            if best_line is None:
-                continue
-
-            [vx, vy, x0, y0] = cv2.fitLine(
-                np.array(best_inliers), cv2.DIST_L2, 0, 0.01, 0.01
-            )
-            direction = np.array([vx, vy]).flatten().astype(np.float32)
-            direction = direction / np.linalg.norm(direction)
-            line = (np.array([x0, y0]).flatten(), direction)
-            lines.append(line)
-
-            diff = remaining - best_line[0]
-            dist = np.abs(diff[:, 0] * best_line[1][1] - diff[:, 1] * best_line[1][0])
-            remaining = remaining[dist >= threshold]
-
-        return lines
-
-    lines = fit_lines_ransac(hull)
-
-    if len(lines) < 6:
-        raise RuntimeError(f"Only found {len(lines)} lines, expected 6.")
-
-    approx_polygon = approximate_hull_polygon(hull)
-
-    def angle_between_lines(a, b):
-        dot = np.clip(abs(np.dot(a, b)), 0.0, 1.0)
-        return np.arccos(dot)
-
-    def point_line_distance(point, line):
-        p, d = line
-        diff = point - p
-        return abs(diff[0] * d[1] - diff[1] * d[0])
-
-    edge_specs = []
-    for i in range(6):
-        start = approx_polygon[i]
-        end = approx_polygon[(i + 1) % 6]
-        direction = end - start
-        direction = direction / np.linalg.norm(direction)
-        midpoint = 0.5 * (start + end)
-        edge_specs.append((direction, midpoint))
-
-    best_perm = None
+    best_polygon = None
     best_score = float("inf")
-    for perm in itertools.permutations(range(6)):
-        score = 0.0
-        for edge_idx, line_idx in enumerate(perm):
-            edge_dir, midpoint = edge_specs[edge_idx]
-            line = lines[line_idx]
-            score += 100.0 * angle_between_lines(edge_dir, line[1])
-            score += point_line_distance(midpoint, line)
 
+    # Try to get exactly 6 points from approxPolyDP.
+    for factor in np.linspace(0.003, 0.08, 80):
+        epsilon = factor * perimeter
+        polygon = cv2.approxPolyDP(hull_contour, epsilon, True)
+        n = len(polygon)
+
+        # Prefer exactly 6. Otherwise keep the closest candidate.
+        score = abs(n - 6) * 1000.0 + epsilon
         if score < best_score:
             best_score = score
-            best_perm = perm
+            best_polygon = polygon
 
-    lines = [lines[i] for i in best_perm]
+        if n == 6:
+            best_polygon = polygon
+            break
 
-    def intersect(l1, l2):
-        p1, d1 = l1
-        p2, d2 = l2
+    if best_polygon is None:
+        raise RuntimeError("Could not approximate board polygon.")
 
-        A = np.array([d1, -d2]).T
-        b = p2 - p1
+    pts = best_polygon.reshape(-1, 2).astype(np.float32)
 
-        if abs(np.linalg.det(A)) < 1e-6:
-            return (p1 + p2) / 2
+    # If approxPolyDP still gives more than 6 points, reduce them by keeping
+    # the six points farthest from the centroid. These are usually the real
+    # outside corners of the board.
+    if len(pts) > 6:
+        centroid = np.mean(pts, axis=0)
+        distances = np.linalg.norm(pts - centroid, axis=1)
+        keep = np.argsort(distances)[-6:]
+        pts = pts[keep]
 
-        t = np.linalg.solve(A, b)
-        return p1 + t[0] * d1
+    if len(pts) < 6:
+        raise RuntimeError(f"Only found {len(pts)} polygon points, expected 6.")
 
-    vertices = []
-    for i in range(6):
-        v = intersect(lines[i], lines[(i + 1) % 6])
-        vertices.append(v)
+    # Sort circularly for drawing and downstream ordering.
+    centroid = np.mean(pts, axis=0)
+    angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
+    pts = pts[np.argsort(angles)]
 
-    polygon = np.array(vertices, dtype=np.float32)
-    height, width = image_bgr.shape[:2]
-    polygon[:, 0] = np.clip(polygon[:, 0], 0, width - 1)
-    polygon[:, 1] = np.clip(polygon[:, 1], 0, height - 1)
+    # Safety check: reject self-crossed / degenerate result.
+    area = abs(cv2.contourArea(pts.astype(np.float32)))
+    if area < 1000:
+        raise RuntimeError("Detected board polygon is too small or degenerate.")
 
-    debug_img = image_bgr.copy()
-    for p, d in lines:
-        p1 = (p - 1000 * d).astype(int)
-        p2 = (p + 1000 * d).astype(int)
-        cv2.line(debug_img, tuple(p1), tuple(p2), (255, 0, 0), 2)
-
-    cv2.imwrite(_debug_path('03_lines.png'), debug_img)
-
-    img_with_poly = draw_contour(image_bgr, polygon)
+    img_with_poly = draw_contour(image_bgr, pts)
     cv2.imwrite(_debug_path('04_approximated_polygon.png'), img_with_poly)
 
-    return polygon
-
+    return pts
 
 def polygon_to_points(polygon):
     arr = np.asarray(polygon, dtype=np.float32)

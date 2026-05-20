@@ -125,8 +125,6 @@ def classify_house_color(peak_hsv, sat_threshold=95):
         return "blue"
     if h <= 12 or h >= 170:
         return "red"
-    if 6 <= h <= 28:
-        return "orange"
     return None
 
 

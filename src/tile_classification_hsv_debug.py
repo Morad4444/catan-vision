@@ -40,6 +40,76 @@ def build_inner_mask(h, w, radius_scale=0.30):
     return ((xx - cx) ** 2 + (yy - cy) ** 2) <= r * r
 
 
+def extract_tile_hsv(tile_patch: np.ndarray) -> dict:
+    hsv = cv2.cvtColor(tile_patch, cv2.COLOR_BGR2HSV)
+    h, w = hsv.shape[:2]
+
+    mask = build_inner_mask(h, w, radius_scale=0.30)
+    vals = hsv[mask]
+    if len(vals) == 0:
+        return {"h": 0.0, "s": 0.0, "v": 0.0}
+
+    vals = vals.astype(np.float32)
+
+    v_lo = np.percentile(vals[:, 2], 8)
+    v_hi = np.percentile(vals[:, 2], 92)
+    keep = (vals[:, 2] >= v_lo) & (vals[:, 2] <= v_hi)
+    core = vals[keep] if np.count_nonzero(keep) >= 20 else vals
+
+    h_med = float(np.median(core[:, 0]))
+    s_med = float(np.median(core[:, 1]))
+    v_med = float(np.median(core[:, 2]))
+
+    return {"h": h_med, "s": s_med, "v": v_med}
+
+
+def classify_hsv_simple(h: float, s: float, v: float) -> str | None:
+    """
+    Simple HSV rules tuned for the current board color ranges.
+    """
+
+    # Desert: pale sand with low saturation
+    if 10 <= h <= 35 and s <= 110 and v >= 100:
+        return "Desert"
+
+    # Ore: greyish stone with high hue and moderate saturation/value
+    if 105 <= h <= 135 and s <= 140 and v <= 110:
+        return "Ore"
+
+    # Brick: brown / orange hills
+    if 0 <= h <= 22 and s >= 55 and 70 <= v <= 145:
+        return "Brick"
+
+    # Grain: yellow fields
+    if 15 <= h <= 35 and s >= 60 and v >= 105:
+        return "Grain"
+
+    # Wool: bright pastel green pasture
+    if 55 <= h <= 85 and s >= 70 and v >= 90:
+        return "Wool"
+
+    # Lumber: darker forest green
+    if 75 <= h <= 105 and s >= 45 and v <= 100:
+        return "Lumber"
+
+    return None
+
+
+def hsv_distance_to_label(h: float, s: float, v: float, label: str) -> float:
+    target = {
+        "Ore":    {"h": 121.0, "s": 100.0, "v": 70.0},
+        "Brick":  {"h": 10.0,  "s": 82.0,  "v": 82.0},
+        "Grain":  {"h": 22.0,  "s": 92.0,  "v": 120.0},
+        "Lumber": {"h": 88.0,  "s": 82.0,  "v": 52.0},
+        "Wool":   {"h": 72.0,  "s": 100.0, "v": 95.0},
+        "Desert": {"h": 20.0,  "s": 55.0,  "v": 118.0},
+    }[label]
+    dh = abs(h - target["h"])
+    ds = abs(s - target["s"])
+    dv = abs(v - target["v"])
+    return 2.0 * dh + 0.35 * ds + 0.25 * dv
+
+
 def robust_tile_features(tile_patch):
     hsv = cv2.cvtColor(tile_patch, cv2.COLOR_BGR2HSV)
     h, w = hsv.shape[:2]
@@ -75,11 +145,12 @@ def robust_tile_features(tile_patch):
     hue = sat_vals[:, 0]
     sat = sat_vals[:, 1]
 
-    green_frac = float(np.mean((hue >= 35) & (hue <= 75)))
-    yellow_frac = float(np.mean((hue >= 16) & (hue <= 34)))
-    red_frac = float(np.mean((hue <= 15) | (hue >= 170)))
-    blue_frac = float(np.mean((hue >= 95) & (hue <= 130)))
-    low_sat_frac = float(np.mean(sat < 60))
+    green_frac = float(np.mean((hue >= 40) & (hue <= 95)))
+    yellow_frac = float(np.mean((hue >= 12) & (hue <= 40)))
+    red_frac = float(np.mean((hue <= 18) | (hue >= 170)))
+    blue_frac = float(np.mean((hue >= 95) & (hue <= 145)))
+    brown_frac = float(np.mean((hue <= 25) & (sat >= 50) & (sat <= 160) & (vals[:, 2] <= 150)))
+    low_sat_frac = float(np.mean(vals[:, 1] < 80))
 
     return {
         "h": h_med,
@@ -89,6 +160,7 @@ def robust_tile_features(tile_patch):
         "yellow_frac": yellow_frac,
         "red_frac": red_frac,
         "blue_frac": blue_frac,
+        "brown_frac": brown_frac,
         "low_sat_frac": low_sat_frac,
     }
 
@@ -109,52 +181,58 @@ def score_tile(tile_patch):
     }
 
     scores["Desert"] = (
-        40.0 * f["low_sat_frac"]
-        - 0.18 * s
-        + 0.04 * v
-        + (10.0 if s < 55 else 0.0)
-        + (8.0 if 12 <= h <= 35 else 0.0)
+        55.0 * f["low_sat_frac"]
+        + 24.0 * f["yellow_frac"]
+        + 18.0 * f["brown_frac"]
+        - 0.12 * abs(h - 20.0)
+        - 0.05 * abs(s - 55.0)
+        - 0.05 * abs(v - 118.0)
+        + (12.0 if 10 <= h <= 35 and s <= 110 and v >= 100 else 0.0)
     )
 
     scores["Ore"] = (
-        38.0 * f["blue_frac"]
-        - 0.09 * abs(h - 112.0)
-        + 0.02 * s
-        - 0.02 * abs(v - 135.0)
-        + (10.0 if 98 <= h <= 128 else 0.0)
+        40.0 * f["low_sat_frac"]
+        + 12.0 * f["blue_frac"]
+        - 0.12 * abs(h - 121.0)
+        - 0.04 * abs(s - 100.0)
+        - 0.20 * abs(v - 70.0)
+        + (12.0 if 105 <= h <= 135 and s <= 140 and v <= 110 else 0.0)
     )
 
     scores["Brick"] = (
-        34.0 * f["red_frac"]
-        + 14.0 * np.clip((18.0 - h) / 18.0, 0.0, 1.0)
-        + 0.02 * s
-        - 0.03 * abs(v - 120.0)
-        + (8.0 if h <= 18 else 0.0)
+        36.0 * f["red_frac"]
+        + 18.0 * f["yellow_frac"]
+        + 12.0 * f["brown_frac"]
+        - 0.10 * abs(h - 10.0)
+        - 0.05 * abs(s - 82.0)
+        - 0.05 * abs(v - 82.0)
+        + (12.0 if 0 <= h <= 22 and s >= 55 and 70 <= v <= 145 else 0.0)
     )
 
     scores["Grain"] = (
-        34.0 * f["yellow_frac"]
-        - 0.10 * abs(h - 24.0)
-        + 0.03 * s
-        + 0.04 * np.clip(v - 135.0, 0.0, 80.0)
-        + (10.0 if 18 <= h <= 34 else 0.0)
+        45.0 * f["yellow_frac"]
+        + 10.0 * f["brown_frac"]
+        - 0.12 * abs(h - 22.0)
+        - 0.05 * abs(s - 92.0)
+        - 0.05 * abs(v - 120.0)
+        + (12.0 if 15 <= h <= 35 and s >= 60 and v >= 105 else 0.0)
     )
 
     scores["Lumber"] = (
-        30.0 * f["green_frac"]
-        - 0.09 * abs(h - 58.0)
-        + 0.015 * s
-        - 0.06 * abs(v - 95.0)
-        + (10.0 if 45 <= h <= 70 and v < 125 else 0.0)
+        42.0 * f["green_frac"]
+        - 0.12 * abs(h - 88.0)
+        - 0.05 * abs(s - 82.0)
+        - 0.08 * abs(v - 52.0)
+        + (12.0 if 75 <= h <= 105 and s >= 45 and v <= 100 else 0.0)
     )
 
     scores["Wool"] = (
-        28.0 * f["green_frac"]
-        - 0.10 * abs(h - 46.0)
-        - 0.03 * abs(s - 95.0)
-        - 0.04 * abs(v - 155.0)
-        + (10.0 if 35 <= h <= 58 and v >= 125 else 0.0)
-        + (6.0 if s < 125 else 0.0)
+        42.0 * f["green_frac"]
+        + 8.0 * f["yellow_frac"]
+        - 0.12 * abs(h - 72.0)
+        - 0.05 * abs(s - 100.0)
+        - 0.08 * abs(v - 95.0)
+        + (12.0 if 55 <= h <= 85 and s >= 70 and v >= 90 else 0.0)
     )
 
     return scores
@@ -192,15 +270,29 @@ def assign_resources_with_counts(all_scores):
     return labels
 
 
-def classify_resources(image_bgr, centers, crop_size=42):
+def classify_resources(image_bgr, centers, crop_size=36):
     all_scores = []
     all_features = []
-    for _, x, y in centers:
+    raw_labels: list[str | None] = [None] * len(centers)
+
+    for tile_id, x, y in centers:
         tile_patch = crop_tile(image_bgr, x, y, size=crop_size)
+        hsv = extract_tile_hsv(tile_patch)
+        all_features.append(hsv)
+
+        raw_label = classify_hsv_simple(hsv["h"], hsv["s"], hsv["v"])
+        if raw_label is None:
+            distances = {
+                label: hsv_distance_to_label(hsv["h"], hsv["s"], hsv["v"], label)
+                for label in RESOURCE_COUNTS
+            }
+            raw_label = min(distances, key=distances.get)
+
+        raw_labels[tile_id] = raw_label
         all_scores.append(score_tile(tile_patch))
-        all_features.append(robust_tile_features(tile_patch))
+
     labels = assign_resources_with_counts(all_scores)
-    return labels, all_scores, all_features
+    return labels, raw_labels, all_features
 
 
 def draw_tile_labels(image_bgr, centers, labels, numbers=None):
