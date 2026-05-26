@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import traceback
-import time
 from pathlib import Path
 
 import cv2
@@ -20,33 +19,8 @@ from board_detection import (
     generate_catan_tile_centers_from_hex,
 )
 
-from chip_detection import (
-    detect_chips,
-    assign_chips_to_tiles,
-    draw_chips,
-    save_chip_debug_patches,
-)
-
-from number_detection_debug import (
-    generate_random_number_layout,
-    create_manual_board_state,
-    analyze_chip_identities,
-    detect_pair_swaps,
-    apply_detected_swaps,
-    print_swap_detected,
-    refresh_pending_reference_edges,
-)
-
-from tile_classification_hsv_debug import (
-    classify_resources,
-    draw_tile_hsv_values,
-)
-
 
 SIDEBAR_WIDTH = 430
-
-CHIP_DEBUG_DIR = Path("data/output/chip_debug_hsv")
-STATE_DIR = Path("data/output/board_state_hsv_debug")
 
 
 def open_camera(index: int):
@@ -61,7 +35,7 @@ def open_camera(index: int):
     return cap
 
 
-def process_board_geometry(image_bgr, prefix="hsv_debug_cached"):
+def process_board_geometry(image_bgr, prefix="hsv_debug"):
     set_debug_prefix(prefix)
 
     contour = detect_board_contour(image_bgr)
@@ -126,19 +100,11 @@ def crop_board_view(image_bgr, ordered_points, margin=180, target_height=700):
     )
 
 
-def make_display_canvas(board_img, lines, status_color=(255, 255, 255)):
+def make_display_canvas(board_img, lines):
     h, w = board_img.shape[:2]
 
     canvas = np.zeros((h, w + SIDEBAR_WIDTH, 3), dtype=np.uint8)
     canvas[:, SIDEBAR_WIDTH:] = board_img
-
-    cv2.line(
-        canvas,
-        (SIDEBAR_WIDTH - 1, 0),
-        (SIDEBAR_WIDTH - 1, h - 1),
-        (80, 80, 80),
-        1,
-    )
 
     panel = canvas[:, :SIDEBAR_WIDTH]
 
@@ -149,87 +115,183 @@ def make_display_canvas(board_img, lines, status_color=(255, 255, 255)):
         line_height=34,
         scale=0.85,
         thickness=2,
-        color=status_color,
+        color=(255, 255, 255),
         bg=False,
     )
 
     return canvas
 
 
-def print_hsv_table(centers, features, labels=None):
+def crop_tile(image_bgr, x, y, size=42):
+    h, w = image_bgr.shape[:2]
+
+    x1 = max(0, int(x - size))
+    y1 = max(0, int(y - size))
+    x2 = min(w, int(x + size))
+    y2 = min(h, int(y + size))
+
+    return image_bgr[y1:y2, x1:x2].copy()
+
+
+def build_inner_mask(h, w, radius_scale=0.30):
+    yy, xx = np.mgrid[0:h, 0:w]
+
+    cx = (w - 1) / 2.0
+    cy = (h - 1) / 2.0
+    r = min(h, w) * radius_scale
+
+    return ((xx - cx) ** 2 + (yy - cy) ** 2) <= r * r
+
+
+def extract_hsv_features(tile_patch_bgr):
+    if tile_patch_bgr is None or tile_patch_bgr.size == 0:
+        return {
+            "h": 0.0,
+            "s": 0.0,
+            "v": 0.0,
+            "green_frac": 0.0,
+            "yellow_frac": 0.0,
+            "red_frac": 0.0,
+            "blue_frac": 0.0,
+            "low_sat_frac": 0.0,
+        }
+
+    hsv = cv2.cvtColor(tile_patch_bgr, cv2.COLOR_BGR2HSV)
+    h_img, w_img = hsv.shape[:2]
+
+    mask = build_inner_mask(h_img, w_img, radius_scale=0.30)
+
+    vals = hsv[mask]
+
+    if len(vals) == 0:
+        vals = hsv.reshape(-1, 3)
+
+    vals = vals.astype(np.float32)
+
+    v_lo = np.percentile(vals[:, 2], 8)
+    v_hi = np.percentile(vals[:, 2], 92)
+
+    keep = (vals[:, 2] >= v_lo) & (vals[:, 2] <= v_hi)
+    vals = vals[keep] if np.count_nonzero(keep) >= 20 else vals
+
+    h_med = float(np.median(vals[:, 0]))
+    s_med = float(np.median(vals[:, 1]))
+    v_med = float(np.median(vals[:, 2]))
+
+    sat_mask = vals[:, 1] >= 45
+    sat_vals = vals[sat_mask] if np.count_nonzero(sat_mask) >= 20 else vals
+
+    hue = sat_vals[:, 0]
+    sat = sat_vals[:, 1]
+
+    green_frac = float(np.mean((hue >= 35) & (hue <= 85)))
+    yellow_frac = float(np.mean((hue >= 16) & (hue <= 38)))
+    red_frac = float(np.mean((hue <= 15) | (hue >= 170)))
+    blue_frac = float(np.mean((hue >= 95) & (hue <= 130)))
+    low_sat_frac = float(np.mean(sat < 60))
+
+    return {
+        "h": h_med,
+        "s": s_med,
+        "v": v_med,
+        "green_frac": green_frac,
+        "yellow_frac": yellow_frac,
+        "red_frac": red_frac,
+        "blue_frac": blue_frac,
+        "low_sat_frac": low_sat_frac,
+    }
+
+
+def compute_all_hsv_features(image_bgr, centers, crop_size=42):
+    features = [None] * len(centers)
+
+    for tile_id, x, y in centers:
+        tile_patch = crop_tile(image_bgr, x, y, size=crop_size)
+        features[tile_id] = extract_hsv_features(tile_patch)
+
+    return features
+
+
+def draw_hsv_values_on_board(image_bgr, centers, features):
+    img = image_bgr.copy()
+
+    for tile_id, x, y in centers:
+        f = features[tile_id]
+
+        lines = [
+            f"{tile_id}",
+            f"H:{int(round(f['h']))}",
+            f"S:{int(round(f['s']))}",
+            f"V:{int(round(f['v']))}",
+        ]
+
+        cv2.circle(img, (x, y), 4, (0, 0, 255), -1)
+
+        start_x = int(x - 22)
+        start_y = int(y - 22)
+
+        for i, txt in enumerate(lines):
+            yy = start_y + i * 13
+
+            cv2.putText(
+                img,
+                txt,
+                (start_x, yy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.32,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+            cv2.putText(
+                img,
+                txt,
+                (start_x, yy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.32,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+    return img
+
+
+def print_hsv_table(centers, features):
     print("\n================ HSV TABLE ================")
 
     for tile_id, _, _ in centers:
         f = features[tile_id]
-
-        label_txt = ""
-        if labels is not None:
-            label_txt = f" label={labels[tile_id]}"
 
         print(
             f"Tile {tile_id:02d}: "
             f"H={f['h']:.1f}, "
             f"S={f['s']:.1f}, "
             f"V={f['v']:.1f}, "
-            f"green={f.get('green_frac', 0.0):.2f}, "
-            f"yellow={f.get('yellow_frac', 0.0):.2f}, "
-            f"red={f.get('red_frac', 0.0):.2f}, "
-            f"blue={f.get('blue_frac', 0.0):.2f}, "
-            f"lowSat={f.get('low_sat_frac', 0.0):.2f}"
-            f"{label_txt}"
+            f"green={f['green_frac']:.2f}, "
+            f"yellow={f['yellow_frac']:.2f}, "
+            f"red={f['red_frac']:.2f}, "
+            f"blue={f['blue_frac']:.2f}, "
+            f"lowSat={f['low_sat_frac']:.2f}"
         )
 
     print("===========================================\n")
 
 
-def handle_capture_board(frame):
-    geom = process_board_geometry(frame, prefix="hsv_manual_capture")
-    centers = geom["centers"]
-
-    resource_labels, _, resource_features = classify_resources(
-        frame,
-        centers,
-    )
-
-    number_map = generate_random_number_layout(
-        centers,
-        resource_labels,
-    )
-
-    return geom, resource_labels, resource_features, number_map
-
-
 def main():
-    CHIP_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-
     cap = open_camera(CAMERA_INDEX)
 
-    cv2.namedWindow(WINDOW_NAME + " - HSV Debug", cv2.WINDOW_NORMAL)
-
     geom = None
-    resource_labels = None
-    resource_features = None
-    number_map = None
-    board_state = None
-
-    monitor_mode = False
-    monitor_start_time = 0.0
-    monitor_warmup_seconds = 1.5
-
+    features = None
     last_message = "press B to capture board"
-    last_swap_tiles = []
 
     print("Controls:")
-    print("  B = capture / recapture board geometry")
+    print("  B = capture / recapture board")
     print("  P = print HSV table")
-    print("  R = re-detect HSV + reroll legal numbers")
-    print("  N = capture chips and start Dice-score monitoring")
     print("  Q or ESC = quit")
     print("")
     print("Important: click the OpenCV window before pressing keys.")
-    print("This version prints every key received by OpenCV.")
-    print("Using number_detection_debug.py")
 
     while True:
         ok, frame = cap.read()
@@ -238,50 +300,27 @@ def main():
             continue
 
         key = cv2.waitKey(1) & 0xFF
-
-        key_chr = ""
-        if key not in (255, 0):
-            try:
-                key_chr = chr(key).lower()
-                print(f"KEY pressed: {key_chr}")
-            except Exception:
-                print(f"KEY pressed code: {key}")
+        key_chr = chr(key).lower() if key not in (255, 0) else ""
 
         try:
-            # --------------------------------------------------
-            # Quit
-            # --------------------------------------------------
-            if key_chr == "q" or key == 27:
-                break
-
-            # --------------------------------------------------
-            # Board capture
-            # --------------------------------------------------
             if key_chr == "b":
-                geom, resource_labels, resource_features, number_map = handle_capture_board(frame)
+                geom = process_board_geometry(frame, prefix="hsv_manual_capture")
+                features = compute_all_hsv_features(frame, geom["centers"])
 
-                board_state = None
-                monitor_mode = False
-                last_swap_tiles = []
-                last_message = "board captured - HSV detected"
+                last_message = "board captured, HSV shown"
+                print("B pressed: board captured.")
 
-                print("B pressed: board captured and HSV values detected.")
-
-            # --------------------------------------------------
-            # If no board yet, only B/Q are useful
-            # --------------------------------------------------
             if geom is None:
-                error_frame = frame.copy()
+                preview = frame.copy()
 
                 put_lines(
-                    error_frame,
+                    preview,
                     [
-                        "No board geometry yet.",
-                        "Click this window.",
+                        "HSV Debug",
                         "Press B to capture board.",
-                        "Then press N to start chip score debug.",
+                        "Then HSV values will appear.",
+                        "Press P to print table.",
                         "",
-                        f"Last key: {key_chr if key_chr else 'none'}",
                         f"Status: {last_message}",
                     ],
                     origin=(20, 40),
@@ -290,197 +329,29 @@ def main():
                     thickness=2,
                 )
 
-                cv2.imshow(WINDOW_NAME + " - HSV Debug", error_frame)
+                cv2.imshow(WINDOW_NAME + " - HSV Debug", preview)
+
+                if key_chr == "q" or key == 27:
+                    break
+
                 continue
 
             centers = geom["centers"]
+
+            if key_chr == "p":
+                features = compute_all_hsv_features(frame, centers)
+                print_hsv_table(centers, features)
+                last_message = "HSV table printed"
+
+            features = compute_all_hsv_features(frame, centers)
+
             overlay = frame.copy()
 
-            # --------------------------------------------------
-            # Re-detect HSV
-            # --------------------------------------------------
-            if key_chr == "r":
-                resource_labels, _, resource_features = classify_resources(
-                    frame,
-                    centers,
-                )
-
-                number_map = generate_random_number_layout(
-                    centers,
-                    resource_labels,
-                )
-
-                board_state = None
-                monitor_mode = False
-                last_swap_tiles = []
-
-                last_message = "HSV re-detected and numbers rerolled"
-                print("R pressed: HSV re-detected and numbers rerolled.")
-
-            # --------------------------------------------------
-            # Print HSV table
-            # --------------------------------------------------
-            elif key_chr == "p":
-                if resource_features is None:
-                    last_message = "press B first"
-                    print("P ignored: press B first.")
-                else:
-                    print_hsv_table(
-                        centers,
-                        resource_features,
-                        labels=resource_labels,
-                    )
-                    last_message = "HSV table printed to terminal"
-
-            # --------------------------------------------------
-            # Start chip debug
-            # --------------------------------------------------
-            elif key_chr == "n":
-                print("N pressed")
-
-                if resource_labels is None or number_map is None:
-                    last_message = "press B first"
-                    print("N ignored: no resource labels or number map yet.")
-
-                else:
-                    chips = detect_chips(
-                        frame,
-                        centers,
-                        resource_labels=resource_labels,
-                    )
-
-                    assignments = assign_chips_to_tiles(
-                        chips,
-                        resource_labels,
-                    )
-
-                    valid_chip_count = sum(
-                        1
-                        for item in assignments
-                        if item.get("chip_patch") is not None
-                    )
-
-                    print(f"chips detected on N: {valid_chip_count}")
-
-                    save_chip_debug_patches(
-                        chips,
-                        CHIP_DEBUG_DIR,
-                    )
-
-                    if valid_chip_count < 10:
-                        last_message = f"N worked, but not enough chips detected ({valid_chip_count})"
-                        print(last_message)
-
-                    else:
-                        board_state = create_manual_board_state(
-                            assignments,
-                            number_map,
-                            STATE_DIR,
-                        )
-
-                        monitor_mode = True
-                        monitor_start_time = time.time()
-                        last_swap_tiles = []
-
-                        last_message = f"monitor started: {valid_chip_count} chips"
-                        print(last_message)
-
-            # --------------------------------------------------
-            # Draw HSV values
-            # --------------------------------------------------
-            if resource_features is not None:
-                overlay = draw_tile_hsv_values(
-                    overlay,
-                    centers,
-                    resource_features,
-                    numbers=number_map,
-                )
-
-            # --------------------------------------------------
-            # Monitoring
-            # --------------------------------------------------
-            if (
-                monitor_mode
-                and resource_labels is not None
-                and number_map is not None
-                and board_state is not None
-            ):
-                chips = detect_chips(
-                    frame,
-                    centers,
-                    resource_labels=resource_labels,
-                )
-
-                assignments = assign_chips_to_tiles(
-                    chips,
-                    resource_labels,
-                )
-
-                overlay = draw_chips(
-                    overlay,
-                    chips,
-                )
-
-                if time.time() - monitor_start_time >= monitor_warmup_seconds:
-                    identity_report = analyze_chip_identities(
-                        assignments,
-                        board_state,
-                        debug_dir=STATE_DIR,
-                    )
-
-                    swaps = detect_pair_swaps(
-                        identity_report,
-                        board_state,
-                        debug_dir=STATE_DIR,
-                    )
-
-                    applied = apply_detected_swaps(
-                        board_state,
-                        swaps,
-                        STATE_DIR,
-                    )
-
-                    refresh_done = refresh_pending_reference_edges(
-                        assignments,
-                        board_state,
-                        STATE_DIR,
-                    )
-
-                    if applied:
-                        number_map = dict(board_state["number_map"])
-                        last_swap_tiles = [
-                            (sw["tile_a"], sw["tile_b"])
-                            for sw in applied
-                        ]
-
-                        print_swap_detected(applied)
-                        last_message = "swap detected"
-
-                    elif refresh_done:
-                        last_message = "references refreshed"
-                        last_swap_tiles = []
-
-                    else:
-                        last_message = "monitoring Dice scores"
-                        last_swap_tiles = []
-
-                else:
-                    last_message = "monitor warmup"
-
-            # --------------------------------------------------
-            # Draw swap highlight
-            # --------------------------------------------------
-            if last_swap_tiles:
-                for a, b in last_swap_tiles:
-                    for tile_id in (a, b):
-                        _, x, y = centers[tile_id]
-                        cv2.circle(
-                            overlay,
-                            (x, y),
-                            42,
-                            (0, 255, 255),
-                            3,
-                        )
+            overlay = draw_hsv_values_on_board(
+                overlay,
+                centers,
+                features,
+            )
 
             overlay = draw_contour(
                 overlay,
@@ -495,21 +366,20 @@ def main():
             )
 
             lines = [
-                "HSV + chip-score debug:",
-                "Click window before keys.",
+                "HSV Debug:",
+                "Board geometry cached.",
+                "No warp / no rotation.",
+                "HSV values shown on board.",
                 "",
-                "B = capture board",
+                "B = recapture board",
                 "P = print HSV table",
-                "R = re-detect HSV",
-                "N = start chip scores",
                 "Q = quit",
                 "",
-                f"Last key: {key_chr if key_chr else 'none'}",
-                f"Mode: {'monitor' if monitor_mode else 'preview'}",
                 f"Status: {last_message}",
             ]
 
             canvas = make_display_canvas(zoomed_overlay, lines)
+
             cv2.imshow(WINDOW_NAME + " - HSV Debug", canvas)
 
         except Exception as exc:
@@ -522,7 +392,7 @@ def main():
                     str(exc),
                     "",
                     "Press B to recapture board.",
-                    "Check terminal for traceback.",
+                    "Check terminal traceback.",
                 ],
                 origin=(20, 40),
                 line_height=30,
@@ -532,6 +402,9 @@ def main():
 
             cv2.imshow(WINDOW_NAME + " - HSV Debug", error_frame)
             traceback.print_exc()
+
+        if key_chr == "q" or key == 27:
+            break
 
     cap.release()
     cv2.destroyAllWindows()

@@ -87,7 +87,7 @@ def classify_hsv(h, s, v):
     # ------------------------------------------------------------
     if (
         37 <= h <= 42
-        and 165 <= s <= 205
+        and 150 <= s <= 230
         and 138 <= v <= 160
     ):
         return "Wool"
@@ -100,8 +100,8 @@ def classify_hsv(h, s, v):
     # ------------------------------------------------------------
     if (
         35 <= h <= 41
-        and 130 <= s <= 160
-        and 70 <= v <= 115
+        and 130 <= s <= 220
+        and 70 <= v <= 110
     ):
         return "Lumber"
 
@@ -114,7 +114,7 @@ def classify_hsv(h, s, v):
     if (
         18 <= h <= 27
         and 30 <= s <= 75
-        and 90 <= v <= 170
+        and 105 <= v <= 140
     ):
         return "Ore"
 
@@ -127,7 +127,7 @@ def classify_hsv(h, s, v):
     if (
         14 <= h <= 19
         and 175 <= s <= 225
-        and 110 <= v <= 145
+        and 110 <= v <= 160
     ):
         return "Brick"
 
@@ -139,8 +139,8 @@ def classify_hsv(h, s, v):
     # ------------------------------------------------------------
     if (
         20 <= h <= 25
-        and 120 <= s <= 220
-        and 155 <= v <= 205
+        and 200 <= s <= 230
+        and 155 <= v <= 190
     ):
         return "Grain"
 
@@ -178,6 +178,9 @@ REFERENCE_VALUES = {
 }
 
 
+DESERT_TILE_ID = 9
+
+
 def classify_resources(image_bgr, centers, crop_size=42):
     n = len(centers)
 
@@ -185,6 +188,7 @@ def classify_resources(image_bgr, centers, crop_size=42):
     features = [None] * n
 
     assigned_counts = {k: 0 for k in RESOURCE_COUNTS}
+    assigned_counts["Desert"] = 1
     missing_tiles = []
 
     for tile_id, x, y in centers:
@@ -199,11 +203,18 @@ def classify_resources(image_bgr, centers, crop_size=42):
 
         features[tile_id] = hsv
 
+        if tile_id == DESERT_TILE_ID:
+            labels[tile_id] = "Desert"
+            continue
+
         label = classify_hsv(
             hsv["h"],
             hsv["s"],
             hsv["v"],
         )
+
+        if label == "Desert":
+            label = None
 
         labels[tile_id] = label
 
@@ -256,12 +267,12 @@ def draw_tile_labels(
 ):
     img = image_bgr.copy()
 
-    number_scale = 0.34
-    number_thickness_outer = 1
-    number_thickness_inner = 1
+    number_scale = 0.50
+    number_thickness_outer = 2
+    number_thickness_inner = 2
 
-    label_scale = 0.22
-    label_thickness = 1
+    label_scale = 0.32
+    label_thickness = 2
 
     for tile_id, x, y in centers:
         label = labels[tile_id]

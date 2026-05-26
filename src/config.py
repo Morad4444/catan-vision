@@ -10,7 +10,7 @@ BOARD_EMPTY_IMAGE = RAW_DIR / "board_empty.png"
 BOARD_NUMBERS_IMAGE = RAW_DIR / "board_numbers_r.png"
 BOARD_PIECES_IMAGE = RAW_DIR / "board_pieces.png"
 
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 WINDOW_NAME = "Catan Live Demo"
 
 NUMBER_POOL = [2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 8, 9, 9, 10, 10, 11, 11, 12]
